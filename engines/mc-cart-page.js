@@ -1,0 +1,1043 @@
+/* ============================================================
+   MC Cart Page Engine v1.1
+   Reads window.mcCartConfig and lets the customer use the theme's
+   native /cart page; intercepts the "Finalizar compra" click to
+   translate the vitrine cart into a Loja B Storefront cart and
+   redirect to checkoutUrl.
+
+   Spec: docs/superpowers/specs/2026-05-07-cart-modes-and-variant-pairing-design.md §3
+   Phase 3.2: full pixel + CAPI + cookie + attribution parity with drawer engine.
+   ============================================================ */
+(function(){
+'use strict';
+
+const C = window.mcCartConfig;
+if (!C || C.cart_mode !== 'cart-page') return;
+
+const POOL = C.pool || { members: [], assigned: null };
+let assignedMember = null;
+let inFlight = false;
+
+/* ---- Cookie helpers (same shape as drawer) ---- */
+function getCookie(name){
+  try {
+    const m = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+    return m ? m[2] : '';
+  } catch (e) { return ''; }
+}
+function setCookie(name, value, maxAgeDays){
+  try {
+    document.cookie = name + '=' + value + ';path=/;max-age=' + (maxAgeDays * 86400) + ';SameSite=Lax';
+  } catch (e) {}
+}
+function genEventId(){
+  return Date.now().toString(36) + '.' + Math.random().toString(36).substr(2, 8);
+}
+
+/* ---- Pool cookie helpers (JSON-encoded, different from tracking cookies) ---- */
+function readCookie(name){
+  try {
+    const m = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+    if (!m) return null;
+    return JSON.parse(decodeURIComponent(m[2]));
+  } catch (e) { return null; }
+}
+function writeCookie(name, value){
+  try {
+    const v = encodeURIComponent(JSON.stringify(value));
+    document.cookie = name + '=' + v + ';path=/;max-age=' + (7 * 24 * 3600);
+  } catch (e) {}
+}
+
+/* ---- First-party persistent anonymous ID ---- */
+function getMcExtId(){
+  let id = getCookie('_mc_ext_id');
+  if (!id) {
+    id = 'mc.' + Date.now().toString(36) + '.' + Math.random().toString(36).substr(2, 12);
+    setCookie('_mc_ext_id', id, 365);
+  }
+  return id;
+}
+const mcExtId = getMcExtId();
+
+/* ---- First-party FBC cookie (survives Safari ITP) ---- */
+(function persistFbc(){
+  try {
+    const p = new URLSearchParams(window.location.search);
+    const fbclid = p.get('fbclid');
+    if (fbclid) {
+      const fbc = 'fb.1.' + Date.now() + '.' + fbclid;
+      setCookie('_fbc', fbc, 90);
+    }
+  } catch (e) {}
+})();
+
+/* ---- First-party GCLID cookie ---- */
+(function persistGclid(){
+  try {
+    const p = new URLSearchParams(window.location.search);
+    const gclid = p.get('gclid');
+    if (gclid) setCookie('_mc_gclid', gclid, 90);
+  } catch (e) {}
+})();
+
+/* ---- Google Ads gtag.js loader ---- */
+if (C.gadsConversionId) {
+  if (!window.gtag) {
+    var _gadsScript = document.createElement('script');
+    _gadsScript.async = true;
+    _gadsScript.src = 'https://www.googletagmanager.com/gtag/js?id=' + C.gadsConversionId;
+    document.head.appendChild(_gadsScript);
+    window.dataLayer = window.dataLayer || [];
+    window.gtag = function(){ window.dataLayer.push(arguments); };
+    window.gtag('js', new Date());
+  }
+  window.gtag('config', C.gadsConversionId, { allow_enhanced_conversions: true });
+}
+
+/* ---- UTM capture + persistence ---- */
+function getUTMs(){
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const utms = {};
+    ['utm_source','utm_medium','utm_campaign','utm_content','utm_term','gclid','fbclid','ttclid','ref','msclkid','li_fat_id','mc_cid','mc_eid'].forEach(function(k){
+      const v = params.get(k);
+      if (v) utms[k] = v;
+    });
+    try {
+      const ga = document.cookie.split(';').find(function(c){ return c.trim().startsWith('_ga='); });
+      if (ga) utms['_ga'] = ga.split('=').slice(1).join('=').trim();
+    } catch (e) {}
+    return utms;
+  } catch (e) { return {}; }
+}
+
+function getSavedUTMs(){
+  try {
+    const s = sessionStorage.getItem('mc_utms');
+    if (s) return JSON.parse(s);
+    const l = localStorage.getItem('mc_utms_last');
+    if (l) return JSON.parse(l);
+  } catch (e) {}
+  return {};
+}
+
+// On page load: capture UTMs into session + first/last touch
+(function captureUTMs(){
+  const pageUTMs = getUTMs();
+  if (Object.keys(pageUTMs).length > 0) {
+    try {
+      if (pageUTMs.utm_source === 'mcsync') {
+        // MC Sync email UTMs take priority (overwrite)
+        sessionStorage.setItem('mc_utms', JSON.stringify(pageUTMs));
+        localStorage.setItem('mc_utms_first', JSON.stringify(pageUTMs));
+        localStorage.setItem('mc_utms_last', JSON.stringify(pageUTMs));
+      } else {
+        sessionStorage.setItem('mc_utms', JSON.stringify(pageUTMs));
+        if (!localStorage.getItem('mc_utms_first')) localStorage.setItem('mc_utms_first', JSON.stringify(pageUTMs));
+        localStorage.setItem('mc_utms_last', JSON.stringify(pageUTMs));
+      }
+    } catch (e) {}
+  }
+})();
+
+/* ---- Meta Conversions API (server-side) ---- */
+function sendCAPI(eventName, data, cur, eventId){
+  try {
+    const metaEventMap = { ViewContent: 'ViewContent', AddToCart: 'AddToCart', InitiateCheckout: 'InitiateCheckout', RemoveFromCart: 'RemoveFromCart' };
+    const metaEvent = metaEventMap[eventName];
+    if (!metaEvent) return;
+
+    if (!eventId) eventId = genEventId();
+    const fbp = getCookie('_fbp');
+    const fbc = getCookie('_fbc') || (function(){
+      const p = new URLSearchParams(window.location.search);
+      const fbclid = p.get('fbclid');
+      if (fbclid) return 'fb.1.' + Date.now() + '.' + fbclid;
+      return '';
+    })();
+
+    let custom_data = {};
+    if (eventName === 'ViewContent') {
+      custom_data = {
+        content_ids: data.contentIds || [],
+        content_type: 'product',
+        content_name: data.name || '',
+        value: parseFloat(data.price) || 0,
+        currency: cur,
+      };
+    } else if (eventName === 'AddToCart') {
+      custom_data = {
+        value: parseFloat(data.price) || 0,
+        currency: cur,
+        content_ids: [data.variantId],
+        content_name: data.name,
+        content_type: 'product',
+        num_items: data.qty || 1,
+      };
+    } else if (eventName === 'InitiateCheckout') {
+      custom_data = {
+        value: parseFloat(data.total) || 0,
+        currency: cur,
+        num_items: data.numItems || 0,
+        content_type: 'product',
+      };
+    } else if (eventName === 'RemoveFromCart') {
+      custom_data = {
+        content_ids: data.variantId ? [data.variantId] : [],
+        content_name: data.name || '',
+        content_type: 'product',
+      };
+    }
+
+    const payload = {
+      events: [{
+        event_name: metaEvent,
+        event_id: eventId,
+        source_url: window.location.href,
+        fbc: fbc,
+        fbp: fbp,
+        external_id: mcExtId,
+        custom_data: custom_data,
+        user_data: {},
+      }],
+    };
+
+    fetch(C.capiEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      keepalive: true,
+    }).then(function(r){ return r.json(); }).then(function(res){
+      if (res.success) console.log('[MC Page CAPI] ' + metaEvent + ' sent ok (events_received: ' + res.events_received + ')');
+      else console.warn('[MC Page CAPI] Error:', res);
+    }).catch(function(e){ console.warn('[MC Page CAPI] Network error:', e.message); });
+  } catch (e) { console.warn('[MC Page CAPI] Error:', e); }
+}
+
+/* ---- Pixel + CAPI firing ---- */
+function trackEvent(eventName, data){
+  try {
+    const cur = (C.currencyCode || 'USD').replace(/[^A-Za-z]/g, '').toUpperCase() || 'USD';
+    const w = window;
+    const found = [];
+    const eventId = genEventId();
+
+    // Meta Pixel (fbq) — with eventID for browser/CAPI dedup
+    if (w.fbq && typeof w.fbq === 'function') {
+      found.push('fbq');
+      if (eventName === 'ViewContent') {
+        w.fbq('track', 'ViewContent', {
+          content_ids: data.contentIds || [],
+          content_type: 'product',
+          content_name: data.name || '',
+          value: parseFloat(data.price) || 0,
+          currency: cur,
+        }, { eventID: eventId });
+      } else if (eventName === 'AddToCart') {
+        w.fbq('track', 'AddToCart', {
+          content_name: data.name,
+          content_ids: [data.variantId],
+          content_type: 'product',
+          value: parseFloat(data.price) || 0,
+          currency: cur,
+          num_items: data.qty || 1,
+        }, { eventID: eventId });
+      } else if (eventName === 'InitiateCheckout') {
+        w.fbq('track', 'InitiateCheckout', {
+          value: parseFloat(data.total) || 0,
+          currency: cur,
+          num_items: data.numItems || 0,
+          content_type: 'product',
+        }, { eventID: eventId });
+      } else if (eventName === 'RemoveFromCart') {
+        w.fbq('trackCustom', 'RemoveFromCart', {
+          content_name: data.name,
+          content_ids: [data.variantId],
+          content_type: 'product',
+        }, { eventID: eventId });
+      }
+    }
+
+    // Google Analytics 4 (gtag)
+    if (w.gtag && typeof w.gtag === 'function') {
+      found.push('gtag');
+      if (eventName === 'AddToCart') {
+        w.gtag('event', 'add_to_cart', {
+          currency: cur,
+          value: parseFloat(data.price) || 0,
+          items: [{ item_id: data.variantId, item_name: data.name, price: parseFloat(data.price) || 0, quantity: data.qty || 1 }],
+        });
+      } else if (eventName === 'InitiateCheckout') {
+        w.gtag('event', 'begin_checkout', {
+          currency: cur,
+          value: parseFloat(data.total) || 0,
+          items: data.items || [],
+        });
+      } else if (eventName === 'RemoveFromCart') {
+        w.gtag('event', 'remove_from_cart', {
+          currency: cur,
+          items: [{ item_id: data.variantId, item_name: data.name }],
+        });
+      }
+    }
+
+    // Google Tag Manager (dataLayer)
+    if (w.dataLayer && Array.isArray(w.dataLayer)) {
+      found.push('dataLayer');
+      if (eventName === 'AddToCart') {
+        w.dataLayer.push({ event: 'add_to_cart', ecommerce: { currency: cur, value: parseFloat(data.price) || 0, items: [{ item_id: data.variantId, item_name: data.name, price: parseFloat(data.price) || 0, quantity: data.qty || 1 }] } });
+      } else if (eventName === 'InitiateCheckout') {
+        w.dataLayer.push({ event: 'begin_checkout', ecommerce: { currency: cur, value: parseFloat(data.total) || 0, items: data.items || [] } });
+      } else if (eventName === 'RemoveFromCart') {
+        w.dataLayer.push({ event: 'remove_from_cart', ecommerce: { items: [{ item_id: data.variantId, item_name: data.name }] } });
+      }
+    }
+
+    // TikTok Pixel
+    if (w.ttq && w.ttq.track) {
+      found.push('ttq');
+      if (eventName === 'AddToCart') w.ttq.track('AddToCart', { content_id: data.variantId, content_name: data.name, value: parseFloat(data.price) || 0, currency: cur });
+      else if (eventName === 'InitiateCheckout') w.ttq.track('InitiateCheckout', { value: parseFloat(data.total) || 0, currency: cur });
+    }
+
+    // Google Ads Conversions
+    if (C.gadsConversionId) {
+      const g = w.gtag;
+      if (g && typeof g === 'function') {
+        if (eventName === 'ViewContent' && C.gadsPageViewLabel) {
+          g('event', 'conversion', { send_to: C.gadsConversionId + '/' + C.gadsPageViewLabel });
+          found.push('gads');
+        } else if (eventName === 'AddToCart' && C.gadsAddToCartLabel) {
+          g('event', 'conversion', { send_to: C.gadsConversionId + '/' + C.gadsAddToCartLabel, value: parseFloat(data.price) || 0, currency: cur });
+          found.push('gads');
+        } else if (eventName === 'InitiateCheckout' && C.gadsCheckoutLabel) {
+          g('event', 'conversion', { send_to: C.gadsConversionId + '/' + C.gadsCheckoutLabel, value: parseFloat(data.total) || 0, currency: cur });
+          found.push('gads');
+        }
+      }
+    }
+
+    // Meta Conversions API (server-side)
+    if (C.capiEndpoint) {
+      found.push('CAPI');
+      sendCAPI(eventName, data, cur, eventId);
+    }
+
+    console.log('[MC Page Track] ' + eventName + ' → ' + (found.join(', ') || 'none'), data);
+
+    // A/B test impression tracking (fires once per page load when test is active)
+    if (window.__mcAbTestId && !window.__mcAbImpSent) {
+      window.__mcAbImpSent = true;
+      if (window.__mcStoreId && window.__mcTrackUrl) {
+        try {
+          fetch(window.__mcTrackUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              storeId: window.__mcStoreId,
+              ab_test_id: window.__mcAbTestId,
+              ab_variant: window.__mcAbVariant,
+              ab_visitor_id: window.__mcAbVisitorId,
+              ab_event: 'impression',
+            }),
+            keepalive: true,
+          }).catch(function(){});
+        } catch (e) {}
+      }
+    }
+  } catch (e) { console.warn('[MC Page] track error', e); }
+}
+
+/* ---- Pool member assignment (lazy, on first ATC or first checkout click) ----
+   The loader (src/app/api/storefront/[storeId]/loader.js/route.ts) emits POOL.members
+   without a `status` field — `getActivePoolMembers` already filters for active members
+   server-side, so every entry in POOL.members is guaranteed active. Use
+   `(m.status || 'active') === 'active'` defensively (matches pickCoherentMember's
+   semantics in cart-coherent.ts). Skip engine has a latent bug here — strict equality
+   `m.status === 'active'` always fails because m.status is undefined. Mode A fixes it. */
+async function ensureMemberAssigned(){
+  if (assignedMember) return assignedMember;
+
+  function isActive(m){ return m && (m.status || 'active') === 'active'; }
+
+  const cookie = readCookie('mc_pool_v1');
+  if (cookie && cookie.mId) {
+    const fromCookie = (POOL.members || []).find(function(m){ return isActive(m) && m.id === cookie.mId; });
+    if (fromCookie) { assignedMember = fromCookie; return fromCookie; }
+  }
+  if (POOL.assigned && POOL.assigned.memberId) {
+    const fromLoader = (POOL.members || []).find(function(m){ return m && m.id === POOL.assigned.memberId; });
+    if (fromLoader) { assignedMember = fromLoader; }
+  }
+  if (!assignedMember) {
+    // BUG FIX 2026-05-17 (PR after #265): previously `.find(isActive)` —
+    // returned the FIRST active member, which is always primary because
+    // getActivePoolMembers orders by `is_primary DESC`. That defeated the
+    // pool's weighted distribution entirely: a member with weight 99 vs a
+    // primary with weight 1 still received 0% of cart-page traffic because
+    // primary was always picked first. Drawer mode escaped this because it
+    // calls /api/pool/resolve which uses pickPoolMember's weighted bucket.
+    // Now we do weighted random selection client-side using the `weight`
+    // field emitted by the loader (PoolEmittedMember.weight).
+    var candidates = (POOL.members || []).filter(isActive)
+      .filter(function(m){ return (m.weight == null ? 1 : m.weight) > 0; });
+    if (candidates.length === 0) {
+      // Defensive fallback — no positive-weight members. Use any active.
+      assignedMember = (POOL.members || []).find(isActive);
+    } else if (candidates.length === 1) {
+      assignedMember = candidates[0];
+    } else {
+      var totalWeight = 0;
+      for (var ci = 0; ci < candidates.length; ci++) {
+        totalWeight += (candidates[ci].weight == null ? 1 : candidates[ci].weight);
+      }
+      var r = Math.random() * totalWeight;
+      for (var i = 0; i < candidates.length; i++) {
+        r -= (candidates[i].weight == null ? 1 : candidates[i].weight);
+        if (r < 0) { assignedMember = candidates[i]; break; }
+      }
+      if (!assignedMember) assignedMember = candidates[candidates.length - 1];
+    }
+  }
+  if (!assignedMember) throw new Error('no_active_pool_member');
+
+  writeCookie('mc_pool_v1', { v: 1, mId: assignedMember.id, exp: Date.now() + 7 * 24 * 3600 * 1000 });
+  return assignedMember;
+}
+
+/* ---- Translation chain (mirrors src/lib/checkout-pool/translate-line.ts) ---- */
+function optionsKey(selectedOptions){
+  if (!selectedOptions || !selectedOptions.length) return '';
+  const parts = selectedOptions
+    .filter(function(o){ return o && o.name && o.value; })
+    .map(function(o){ return o.name.toLowerCase() + '=' + o.value.toLowerCase(); });
+  if (!parts.length) return '';
+  parts.sort();
+  return parts.join('|');
+}
+
+function translateLine(line, member){
+  const productGid = 'gid://shopify/Product/' + String(line.productId);
+  const mappings = (member && member.productMappings) || {};
+  const m = mappings[productGid];
+  if (!m) return null;
+
+  const variantIdStr = String(line.variantId);
+  if (m.vitrineVariantPairs && m.vitrineVariantPairs[variantIdStr]) {
+    return m.vitrineVariantPairs[variantIdStr];
+  }
+  const k = optionsKey(line.selectedOptions);
+  if (k && m.variantsByOptions && m.variantsByOptions[k]) {
+    return m.variantsByOptions[k];
+  }
+  if (line.sku && m.variantsBySku && m.variantsBySku[line.sku]) {
+    return m.variantsBySku[line.sku];
+  }
+  return null;
+}
+
+/* ---- Cart-coherent member selection (mirrors src/lib/checkout-pool/cart-coherent.ts) ---- */
+function pickCoherentMember(lines, members, assignedMemberId){
+  function fulfills(member){
+    for (let i = 0; i < lines.length; i++) {
+      if (translateLine(lines[i], member) == null) return false;
+    }
+    return true;
+  }
+  if (assignedMemberId) {
+    const a = (members || []).find(function(m){ return m && m.id === assignedMemberId && (m.status || 'active') === 'active'; });
+    if (a && fulfills(a)) return a;
+  }
+  for (let i = 0; i < (members || []).length; i++) {
+    const m = members[i];
+    if (!m) continue;
+    if ((m.status || 'active') !== 'active') continue;
+    if (m.id === assignedMemberId) continue;
+    if (fulfills(m)) return m;
+  }
+  return null;
+}
+
+/* ---- Storefront cart create on Loja B (multi-line) ---- */
+async function createLojaBCart(member, lines, opts){
+  // opts: { autoDiscount, extraDiscountCodes, attributes, note }
+  const url = 'https://' + member.domain + '/api/2024-10/graphql.json';
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Shopify-Storefront-Access-Token': member.storefrontToken,
+  };
+
+  const input = { lines: lines };
+  const codes = [];
+  if (opts && opts.autoDiscount) codes.push(opts.autoDiscount);
+  if (opts && Array.isArray(opts.extraDiscountCodes)) {
+    for (let i = 0; i < opts.extraDiscountCodes.length; i++) {
+      const c = opts.extraDiscountCodes[i];
+      if (c) codes.push(c);
+    }
+  }
+  if (codes.length) input.discountCodes = codes;
+  if (opts && opts.attributes && opts.attributes.length) input.attributes = opts.attributes;
+  if (opts && opts.note) input.note = opts.note;
+
+  const body = JSON.stringify({
+    query: 'mutation($input:CartInput!){cartCreate(input:$input){cart{id checkoutUrl cost{totalAmount{amount}}}userErrors{message}}}',
+    variables: { input: input },
+  });
+  const res = await fetch(url, { method: 'POST', headers: headers, body: body });
+  const data = await res.json();
+  if (data.errors) throw new Error(data.errors[0].message);
+  const userErrors = data.data && data.data.cartCreate && data.data.cartCreate.userErrors;
+  if (userErrors && userErrors.length) throw new Error(userErrors[0].message);
+  if (!data.data || !data.data.cartCreate || !data.data.cartCreate.cart) throw new Error('cartCreate_no_cart');
+  return data.data.cartCreate.cart;
+}
+
+/* ---- Loading overlay ---- */
+function escapeHtml(s){
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+function showLoadingOverlay(){
+  if (document.getElementById('mc-page-overlay')) return;
+  // Subtle overlay that mimics a native browser/Shopify checkout transition:
+  // no white modal box, no text, just a centered ring spinner over a faint
+  // backdrop. Looks like the page is fading out into the next route rather
+  // than like a custom MC popup. Merchant can opt back into a labeled modal
+  // by setting cart_config.cartPageLoadingText — when present we render the
+  // text alongside the spinner (still in a subtle pill, not a heavy modal).
+  const text = (C.cartPageLoadingText && String(C.cartPageLoadingText)) || '';
+  const o = document.createElement('div');
+  o.id = 'mc-page-overlay';
+  o.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.18);z-index:99999;display:flex;align-items:center;justify-content:center;-webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px);transition:opacity .2s ease;';
+  const spinnerSvg = '<svg width="40" height="40" viewBox="0 0 24 24" style="animation:mcSpin .8s linear infinite;display:block;"><circle cx="12" cy="12" r="10" stroke="rgba(255,255,255,.25)" stroke-width="2.5" fill="none"/><circle cx="12" cy="12" r="10" stroke="#fff" stroke-width="2.5" fill="none" stroke-dasharray="60" stroke-dashoffset="40" stroke-linecap="round"/></svg>';
+  if (text) {
+    o.innerHTML = '<div style="display:flex;flex-direction:column;align-items:center;gap:14px;">' +
+      spinnerSvg +
+      '<span style="color:#fff;font:500 13px/1.4 system-ui,-apple-system,sans-serif;text-shadow:0 1px 2px rgba(0,0,0,.2);letter-spacing:.01em;">' + escapeHtml(text) + '</span>' +
+      '</div>' +
+      '<style>@keyframes mcSpin{to{transform:rotate(360deg)}}</style>';
+  } else {
+    o.innerHTML = spinnerSvg + '<style>@keyframes mcSpin{to{transform:rotate(360deg)}}</style>';
+  }
+  document.body.appendChild(o);
+}
+function hideLoadingOverlay(){
+  const o = document.getElementById('mc-page-overlay');
+  if (o) o.remove();
+}
+
+/* ---- Error UX ---- */
+function showErrorModal(message){
+  try { alert(message); } catch (e) { console.error('[MC Page] alert blocked:', message); }
+}
+
+function logSystemEvent(code, detail){
+  try {
+    const url = window.__mcTrackUrl;
+    if (!url) return;
+    const storeId = window.__mcStoreId;
+    fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ store_id: storeId, code: code, source: 'mc-cart-page', detail: detail || null }),
+      keepalive: true,
+    }).catch(function(){});
+  } catch (e) {}
+}
+
+/* ---- Read native vitrine cart ---- */
+async function readVitrineCart(){
+  const r = await fetch('/cart.js', { credentials: 'same-origin' });
+  if (!r.ok) throw new Error('cart_read_failed');
+  const cart = await r.json();
+  const lines = (cart.items || []).map(function(it){
+    let selectedOptions = [];
+    if (Array.isArray(it.options_with_values)) {
+      selectedOptions = it.options_with_values.map(function(o){ return { name: o.name, value: o.value }; });
+    } else if (Array.isArray(it.variant_options) && Array.isArray(it.options)) {
+      selectedOptions = it.options.map(function(name, i){ return { name: name, value: it.variant_options[i] }; });
+    }
+    return {
+      productId: it.product_id,
+      variantId: it.variant_id,
+      sku: it.sku || null,
+      selectedOptions: selectedOptions,
+      quantity: it.quantity || 1,
+    };
+  });
+  return {
+    items: cart.items || [],
+    lines: lines,
+    totalQuantity: cart.item_count || 0,
+    note: cart.note || '',
+    discount_applications: cart.discount_applications || [],
+    cart_level_discount_applications: cart.cart_level_discount_applications || [],
+  };
+}
+
+/* ---- Build cart attributes from UTMs + meta cookies + AB test ---- */
+function buildCartAttributes(){
+  const utms = getSavedUTMs();
+  const cartAttributes = [];
+  const utmKeys = Object.keys(utms);
+  for (let i = 0; i < utmKeys.length; i++) {
+    const k = utmKeys[i];
+    const v = utms[k];
+    if (v) cartAttributes.push({ key: k, value: String(v) });
+  }
+  // NOTE: document.referrer was previously captured here, but it adds noise
+  // to the order's note_attributes (e.g. "https://www.serelune.co.uk/products/..."
+  // for in-session navigation). Shopify already captures the real marketing
+  // referrer via `referring_site` (the HTTP Referer header on initial landing,
+  // which holds facebook.com / google.com / etc when the customer came from
+  // an ad). UTMs above carry the explicit campaign data. Keeping document.referrer
+  // as a cart attribute duplicated noise without adding signal — dropped.
+  cartAttributes.push({ key: '_mc_ext_id', value: mcExtId });
+  const _fbc = getCookie('_fbc');
+  if (_fbc) cartAttributes.push({ key: '_fbc', value: _fbc });
+  const _fbp = getCookie('_fbp');
+  if (_fbp) cartAttributes.push({ key: '_fbp', value: _fbp });
+  if (window.__mcAbTestId) {
+    cartAttributes.push({ key: '_mc_ab_test_id', value: window.__mcAbTestId });
+    if (window.__mcAbVariant) cartAttributes.push({ key: '_mc_ab_variant', value: window.__mcAbVariant });
+  }
+  return cartAttributes;
+}
+
+/* ---- Build Loja B line items from vitrine cart (with properties) ---- */
+function buildLojaBLines(vitrineCart, member){
+  return vitrineCart.lines.map(function(line, i){
+    const origItem = vitrineCart.items[i];
+    const lineAttrs = [];
+    if (origItem && origItem.properties && typeof origItem.properties === 'object') {
+      const keys = Object.keys(origItem.properties);
+      for (let j = 0; j < keys.length; j++) {
+        const k = keys[j];
+        if (!Object.prototype.hasOwnProperty.call(origItem.properties, k)) continue;
+        if (k.startsWith('_')) continue; // skip Shopify private properties
+        const v = origItem.properties[k];
+        lineAttrs.push({ key: k, value: String(v) });
+      }
+    }
+    const result = {
+      merchandiseId: translateLine(line, member),
+      quantity: line.quantity,
+    };
+    if (lineAttrs.length) result.attributes = lineAttrs;
+    return result;
+  });
+}
+
+/* ---- Extract native discount codes from vitrine cart ---- */
+function extractNativeDiscountCodes(vitrineCart){
+  const nativeDiscountCodes = [];
+  try {
+    const apps = (vitrineCart.cart_level_discount_applications || []).concat(vitrineCart.discount_applications || []);
+    for (let i = 0; i < apps.length; i++) {
+      const a = apps[i];
+      if (a && a.code) nativeDiscountCodes.push(a.code);
+    }
+  } catch (e) {}
+  return nativeDiscountCodes;
+}
+
+/* ---- The core handler: hijack "Finalizar compra" click ---- */
+async function handleCheckoutClick(){
+  if (inFlight) return;
+  inFlight = true;
+  showLoadingOverlay();
+
+  try {
+    const vitrineCart = await readVitrineCart();
+    if (!vitrineCart.lines.length) throw new Error('cart_empty');
+
+    await ensureMemberAssigned();
+
+    let member = pickCoherentMember(vitrineCart.lines, POOL.members, assignedMember && assignedMember.id);
+    if (!member) {
+      logSystemEvent('mode_a_no_coherent_member', { lineCount: vitrineCart.lines.length });
+      throw new Error('no_member_can_fulfill');
+    }
+
+    if (member.id !== (assignedMember && assignedMember.id)) {
+      assignedMember = member;
+      writeCookie('mc_pool_v1', { v: 1, mId: member.id, exp: Date.now() + 7 * 24 * 3600 * 1000 });
+    }
+
+    const cartAttributes = buildCartAttributes();
+    const nativeDiscountCodes = extractNativeDiscountCodes(vitrineCart);
+    const cartNote = vitrineCart.note || undefined;
+    let lojaBLines = buildLojaBLines(vitrineCart, member);
+
+    // Phase 3.4 — Cart Permalink branch (opt-in, native Shopify attribution)
+    if (C.cartPageCheckoutMethod === 'permalink') {
+      // Build permalink URL using inline helper (mirrors src/lib/cart-page/permalink.ts).
+      // No Storefront API call, no userErrors handling, no retry — Loja B creates
+      // cart natively when customer hits the URL, and ?return_to=/checkout skips
+      // the /cart page intermediate.
+      //
+      // Limitation: line item properties (origItem.properties) are NOT supported
+      // by Shopify cart permalinks. We log a system_event when lojaBLines have
+      // attributes, so merchants can see if they're losing per-line data.
+      var hasLineProperties = lojaBLines.some(function(l){ return l.attributes && l.attributes.length; });
+      if (hasLineProperties) {
+        logSystemEvent('mode_a_permalink_dropped_line_props', { count: vitrineCart.lines.length });
+      }
+
+      // Convert attributes array → flat object for URL params
+      var attrObj = {};
+      for (var _ai = 0; _ai < cartAttributes.length; _ai++) {
+        var _a = cartAttributes[_ai];
+        if (_a && _a.key) attrObj[_a.key] = _a.value;
+      }
+
+      // Convert GID → numeric variant ID for permalink
+      function _stripVariantGid(s){
+        return String(s).replace(/^gid:\/\/shopify\/ProductVariant\//, '');
+      }
+
+      var _permalinkLines = lojaBLines.map(function(l){
+        return _stripVariantGid(l.merchandiseId) + ':' + Math.max(1, Math.floor(l.quantity || 1));
+      }).join(',');
+
+      var _permalinkParams = new URLSearchParams();
+      // Shopify only honors a single discount via permalink; prefer autoDiscount, fall back to first native
+      var _pickedDiscount = C.autoDiscount || (nativeDiscountCodes && nativeDiscountCodes[0]) || '';
+      if (_pickedDiscount) _permalinkParams.set('discount', _pickedDiscount);
+      for (var _k in attrObj) {
+        if (Object.prototype.hasOwnProperty.call(attrObj, _k) && attrObj[_k] != null) {
+          _permalinkParams.set('attributes[' + _k + ']', String(attrObj[_k]));
+        }
+      }
+      if (cartNote) _permalinkParams.set('note', cartNote);
+      _permalinkParams.set('return_to', '/checkout');
+
+      // Per-member custom domain resolution (Phase 3.6).
+      // Priority: member's own permalink_domain (set per-member when pool has 2+
+      // active members) > legacy C.cartPageCheckoutDomain (pool-of-1 fallback)
+      // > member.domain (.myshopify.com). Custom domains are bound to a single
+      // Shopify store, so multi-member pools need ONE custom domain per member.
+      var _permalinkDomain = (member.permalinkDomain && String(member.permalinkDomain).trim())
+        || (C.cartPageCheckoutDomain && String(C.cartPageCheckoutDomain).trim())
+        || member.domain;
+      var _permalinkUrl = 'https://' + _permalinkDomain + '/cart/' + _permalinkLines + '?' + _permalinkParams.toString();
+
+      // Fire InitiateCheckout pixel — total unknown without API call; use 0
+      // (acceptable — server-side Purchase event will carry the final amount)
+      trackEvent('InitiateCheckout', {
+        total: 0,
+        numItems: vitrineCart.totalQuantity,
+        items: vitrineCart.lines.map(function(l){
+          return { item_id: String(l.variantId), quantity: l.quantity };
+        }),
+      });
+
+      window.location.href = _permalinkUrl;
+      return;
+    }
+
+    const cartOpts = {
+      autoDiscount: C.autoDiscount,
+      extraDiscountCodes: nativeDiscountCodes,
+      attributes: cartAttributes,
+      note: cartNote,
+    };
+
+    async function tryCreateCart(memberToUse, linesToUse){
+      return createLojaBCart(memberToUse, linesToUse, cartOpts);
+    }
+
+    let cart;
+    try {
+      cart = await tryCreateCart(member, lojaBLines);
+    } catch (firstErr) {
+      console.warn('[MC Page] cartCreate failed, trying next member', firstErr && firstErr.message);
+      const nextMembers = (POOL.members || []).filter(function(m){ return m && m.id !== member.id; });
+      const fallback = pickCoherentMember(vitrineCart.lines, nextMembers, null);
+      if (fallback) {
+        member = fallback;
+        assignedMember = fallback;
+        writeCookie('mc_pool_v1', { v: 1, mId: fallback.id, exp: Date.now() + 7 * 24 * 3600 * 1000 });
+        lojaBLines = buildLojaBLines(vitrineCart, fallback);
+        cart = await tryCreateCart(fallback, lojaBLines);
+      } else {
+        throw firstErr;
+      }
+    }
+
+    trackEvent('InitiateCheckout', {
+      total: cart.cost && cart.cost.totalAmount && cart.cost.totalAmount.amount,
+      numItems: vitrineCart.totalQuantity,
+      items: vitrineCart.lines.map(function(l){
+        return { item_id: String(l.variantId), quantity: l.quantity };
+      }),
+    });
+
+    window.location.href = cart.checkoutUrl;
+  } catch (err) {
+    inFlight = false;
+    hideLoadingOverlay();
+    const code = (err && err.message) || 'unknown';
+    console.error('[MC Page] checkout error:', code);
+    if (code === 'cart_empty') {
+      window.location.href = '/cart';
+      return;
+    }
+    if (code === 'no_member_can_fulfill') {
+      showErrorModal('Um ou mais produtos do carrinho estão temporariamente indisponíveis. Recarregue a página ou contate o suporte.');
+      return;
+    }
+    if (code === 'no_active_pool_member') {
+      showErrorModal('O checkout está temporariamente indisponível. Tente novamente em instantes.');
+      return;
+    }
+    showErrorModal('Não conseguimos finalizar agora. Tente novamente em instantes.');
+    logSystemEvent('mode_a_checkout_error', { code: code });
+  }
+}
+
+/* ---- ATC interception (light — does NOT block native) ---- */
+/* ---- Bug 2 follow-up: disable checkout buttons while an ATC fetch
+   is in flight. The race window: customer clicks ATC on a cart-page
+   upsell → engine intercepts /cart/add.js (fires AddToCart pixel,
+   triggers theme's cart refresh) → customer fast-clicks "Check out"
+   before the ATC roundtrip settles → native form submit might slip
+   through depending on theme handler order + DOM rebuild timing.
+
+   Fix: gate checkout buttons visually + functionally via a body class
+   that's added on every ATC fetch start and removed on settle. CSS
+   `pointer-events: none` blocks the click entirely; the user sees a
+   wait-cursor and a dimmed button for the 200-500ms while cart is
+   updating. Once settled, gate releases automatically. */
+(function _injectAtcInflightStyle(){
+  if (document.getElementById('mc-page-atc-inflight-style')) return;
+  var s = document.createElement('style');
+  s.id = 'mc-page-atc-inflight-style';
+  s.textContent =
+    'body.mc-page-atc-inflight a[href$="/checkout"],'+
+    'body.mc-page-atc-inflight a[href*="/checkout?"],'+
+    'body.mc-page-atc-inflight a[data-mc-original-href],'+
+    'body.mc-page-atc-inflight button[name="checkout"],'+
+    'body.mc-page-atc-inflight input[name="checkout"],'+
+    'body.mc-page-atc-inflight button[type="submit"][formaction$="/checkout"]'+
+    '{pointer-events:none!important;opacity:.7!important;cursor:wait!important;}';
+  (document.head || document.documentElement).appendChild(s);
+})();
+
+function setupATCHook(){
+  const _fetch = window.fetch;
+  window.fetch = async function(input, init){
+    const url = typeof input === 'string' ? input : (input && input.url) || '';
+    const isAtc = url.indexOf('/cart/add.js') !== -1 || url.indexOf('/cart/add') !== -1;
+    const isChange = url.indexOf('/cart/change') !== -1 || url.indexOf('/cart/update') !== -1;
+    if (isAtc) {
+      // Add the gating class BEFORE the native fetch starts; remove in finally
+      // so the gate always releases even on network error / abort.
+      try { document.body && document.body.classList.add('mc-page-atc-inflight'); } catch (e) {}
+      try {
+        onAtcDetected(init && init.body).catch(function(){});
+      } catch (e) {}
+    }
+    let response;
+    try {
+      response = await _fetch.apply(this, arguments);
+    } finally {
+      if (isAtc) {
+        try { document.body && document.body.classList.remove('mc-page-atc-inflight'); } catch (e) {}
+      }
+    }
+    if (isChange) {
+      // Best-effort: fire RemoveFromCart if /cart/change sent quantity=0
+      try {
+        let removed = false;
+        const body = init && init.body;
+        if (body instanceof FormData) {
+          const q = body.get('quantity');
+          if (q === '0' || q === 0) removed = true;
+        } else if (typeof body === 'string') {
+          try {
+            const j = JSON.parse(body);
+            if (j.quantity === 0 || j.quantity === '0') removed = true;
+          } catch (_) {}
+        }
+        if (removed) {
+          trackEvent('RemoveFromCart', { variantId: '', name: '', price: 0 });
+        }
+      } catch (e) {}
+    }
+    return response;
+  };
+
+  document.addEventListener('submit', function(e){
+    const form = e.target;
+    if (form && form.matches && form.matches('form[action*="/cart/add"]')) {
+      try {
+        const fd = new FormData(form);
+        onAtcDetected(fd).catch(function(){});
+      } catch (e) {}
+    }
+  }, true);
+}
+
+async function onAtcDetected(body){
+  let variantId = null, quantity = 1;
+  try {
+    if (body instanceof FormData) {
+      variantId = body.get('id');
+      quantity = parseInt(body.get('quantity') || '1', 10) || 1;
+    } else if (typeof body === 'string') {
+      try {
+        const j = JSON.parse(body);
+        variantId = j.id || (j.items && j.items[0] && j.items[0].id);
+        quantity = j.quantity || 1;
+      } catch (_) {
+        const params = new URLSearchParams(body);
+        variantId = params.get('id');
+        quantity = parseInt(params.get('quantity') || '1', 10) || 1;
+      }
+    }
+  } catch (e) {}
+
+  // Try to enrich with product data (name + price)
+  let name = '', price = 0;
+  if (variantId && location.pathname.match(/^\/products\//)) {
+    try {
+      const handle = location.pathname.split('/products/')[1].split(/[\/?#]/)[0];
+      const pData = await fetch('/products/' + handle + '.js')
+        .then(function(r){ return r.ok ? r.json() : null; })
+        .catch(function(){ return null; });
+      if (pData) {
+        name = pData.title || '';
+        const variants = pData.variants || [];
+        for (let i = 0; i < variants.length; i++) {
+          if (String(variants[i].id) === String(variantId)) {
+            price = (variants[i].price || 0) / 100; // /products/X.js price is in cents
+            break;
+          }
+        }
+      }
+    } catch (e) {}
+  }
+
+  try { await ensureMemberAssigned(); } catch (e) {}
+
+  if (variantId) {
+    trackEvent('AddToCart', {
+      variantId: String(variantId),
+      name: name,
+      price: price,
+      qty: quantity,
+    });
+  }
+}
+
+/* ---- Checkout-button hijack (capture-phase, document-level) ---- */
+function setupCheckoutHooks(){
+  document.addEventListener('click', function(e){
+    const t = e.target && e.target.closest && e.target.closest(
+      'a[href$="/checkout"], a[href*="/checkout?"], a[data-mc-original-href], ' +
+      'button[name="checkout"], input[name="checkout"], ' +
+      'button[type="submit"][formaction$="/checkout"]'
+    );
+    if (!t) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.stopImmediatePropagation();
+    handleCheckoutClick();
+  }, true);
+
+  document.addEventListener('submit', function(e){
+    const form = e.target;
+    if (!form || !form.matches || !form.matches('form[action="/cart"], form[action$="/cart"]')) return;
+    const submitter = e.submitter;
+    const isCheckoutSubmitter = submitter && (
+      submitter.name === 'checkout' ||
+      submitter.value === 'checkout' ||
+      (submitter.getAttribute && submitter.getAttribute('formaction') &&
+       submitter.getAttribute('formaction').indexOf('/checkout') !== -1)
+    );
+    if (isCheckoutSubmitter) {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      handleCheckoutClick();
+      return;
+    }
+    // Phase 3.3 — Gap 3: detect line removals via updates[*]=0 inputs.
+    // Native /cart form submit (non-AJAX) carries inputs like
+    // <input name="updates[44091723644992]" value="0"> when a line is
+    // removed. Fire RemoveFromCart but DO NOT preventDefault — let the
+    // theme's form submit complete normally.
+    try {
+      const updatesInputs = form.querySelectorAll('input[name^="updates"], select[name^="updates"]');
+      let removed = false;
+      updatesInputs.forEach(function(inp){
+        if (String(inp.value) === '0') removed = true;
+      });
+      if (removed) {
+        trackEvent('RemoveFromCart', { variantId: '', name: '', price: 0 });
+      }
+    } catch (e) {}
+  }, true);
+
+  if (location.pathname === '/cart' || location.pathname === '/cart/') {
+    function rewriteCheckoutLinks(){
+      document.querySelectorAll('a[href$="/checkout"], a[href*="/checkout?"]').forEach(function(a){
+        if (a.dataset.mcOriginalHref) return;
+        a.dataset.mcOriginalHref = a.href;
+        a.setAttribute('href', 'javascript:void(0)');
+      });
+    }
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', rewriteCheckoutLinks);
+    } else {
+      rewriteCheckoutLinks();
+    }
+    if (typeof MutationObserver !== 'undefined') {
+      const obs = new MutationObserver(function(){ rewriteCheckoutLinks(); });
+      try { obs.observe(document.body, { childList: true, subtree: true }); } catch (e) {}
+    }
+  }
+}
+
+// Fire ViewContent if we're on a PDP (loader emits cfg.currentProductGid only on /products/*)
+if (C.currentProductGid) {
+  trackEvent('ViewContent', {
+    contentIds: [C.currentProductGid],
+    name: document.title || C.currentProductHandle || '',
+    price: 0,
+  });
+}
+
+setupATCHook();
+setupCheckoutHooks();
+
+/* ---- Bug 1 fix: bfcache restore cleanup ----
+   When customer clicks Check out, we set inFlight=true + showLoadingOverlay,
+   then redirect. Browser saves the page state in bfcache (back-forward cache)
+   WITH the overlay DOM still attached. If customer presses Back, the browser
+   restores the page from bfcache and the overlay is still there — but no JS
+   runs to remove it (bfcache restore does NOT re-execute scripts), so the
+   spinner sits forever until F5.
+
+   Standard fix: listen for pageshow with event.persisted=true (= restored
+   from bfcache) and clean up overlay + reset inFlight. */
+window.addEventListener('pageshow', function(event){
+  if (event.persisted) {
+    hideLoadingOverlay();
+    inFlight = false;
+  }
+});
+
+/* ---- Bug 2 fix: signal engine is ready so the loader can release its
+   pre-emptive checkout gate. Without the gate, a customer who clicks
+   "Check out" before this engine has booted (race window ~100-500ms on
+   cold pageload, especially after a rapid ATC of an upsell) bypasses the
+   capture-phase listener entirely and lands on the Vitrine /checkout. */
+window.__mcCartReady = true;
+
+console.log('[MC Page] engine v1.2 loaded for store ' + (window.__mcStoreId || ''));
+})();
