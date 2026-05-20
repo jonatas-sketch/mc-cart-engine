@@ -86,6 +86,63 @@
   }
 
   function proceedWithFallback(reason) {
-    // Stub here; filled in Task 2.7.
+    var snap = readSnapshot();
+    if (!snap) {
+      try { console.warn('[MC Cart] Railway unavailable + no local snapshot. Reason:', reason); } catch (e) {}
+      sendBeacon(reason, 'no_snapshot', null);
+      return;
+    }
+    window.mcCartConfig = snap.cfg;
+    window.__mcStoreId  = STORE_ID;
+    window.__mcTrackUrl = APP_ORIGIN + '/api/track';
+    window.__mcCartFallbackMode = {
+      reason: reason,
+      since: Date.now(),
+      snapshotAt: snap.savedAt,
+      source: 'localstorage',
+    };
+    try { console.warn('[MC Cart] running in fallback mode', window.__mcCartFallbackMode); } catch (e) {}
+
+    var engineFile = snap.engineFile || deriveEngineFile(snap.cfg);
+    var s = document.createElement('script');
+    s.src = CDN_ENGINE_BASE + '/' + engineFile;
+    s.defer = true;
+    document.head.appendChild(s);
+
+    // Inter font (mirror loader behavior)
+    var l = document.createElement('link');
+    l.rel = 'stylesheet';
+    l.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap';
+    document.head.appendChild(l);
+
+    sendBeacon(reason, 'snapshot_hit', snap.savedAt);
+  }
+
+  function readSnapshot() {
+    try {
+      var raw = localStorage.getItem('mc_cart_snapshot_v1_' + STORE_ID);
+      if (!raw) return null;
+      var snap = JSON.parse(raw);
+      if (!snap || snap.v !== 1 || !snap.cfg || !snap.savedAt) return null;
+      if (Date.now() - snap.savedAt > SNAPSHOT_TTL_MS) return null;
+      return snap;
+    } catch (e) { return null; }
+  }
+
+  function sendBeacon(reason, outcome, snapshotAt) {
+    try {
+      var payload = JSON.stringify({
+        storeId: STORE_ID,
+        reason: reason,
+        outcome: outcome,
+        snapshotAt: snapshotAt,
+        t: Date.now(),
+      });
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(BEACON_URL, payload);
+      } else {
+        fetch(BEACON_URL, { method: 'POST', body: payload, headers: { 'Content-Type': 'application/json' }, keepalive: true }).catch(function () {});
+      }
+    } catch (e) {}
   }
 })();

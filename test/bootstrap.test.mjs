@@ -79,3 +79,102 @@ test('bootstrap: Railway 200 → persiste snapshot em localStorage após 500ms',
   assert.equal(snap.engineFile, 'mc-cart-page.js');
   assert.ok(snap.savedAt > 0);
 });
+
+test('bootstrap: Railway 500 + snapshot LS válido → hidrata mcCartConfig + injeta engine do CDN', async () => {
+  const seedSnap = {
+    v: 1,
+    savedAt: Date.now() - 60_000, // 1 min ago
+    cfg: { cart_mode: 'drawer', domain: 'b.myshopify.com', token: 't' },
+    engineFile: 'mc-cart.js',
+  };
+  const { window, script } = buildDom({
+    dataStoreId: UUID_A,
+    localStorageSeed: { ['mc_cart_snapshot_v1_' + UUID_A]: JSON.stringify(seedSnap) },
+    fetchImpl: () => Promise.resolve({ ok: false, status: 503, text: () => Promise.resolve('') }),
+  });
+  runBootstrap(window, script);
+  await flush(window, 50);
+
+  assert.equal(window.mcCartConfig.cart_mode, 'drawer');
+  assert.equal(window.__mcStoreId, UUID_A);
+  assert.ok(window.__mcCartFallbackMode);
+  assert.equal(window.__mcCartFallbackMode.source, 'localstorage');
+  assert.equal(window.__mcCartFallbackMode.reason, 'railway_503');
+
+  const scripts = window.document.head.querySelectorAll('script');
+  const engineScript = Array.from(scripts).find((s) => s.src && s.src.includes('/engines/mc-cart.js'));
+  assert.ok(engineScript, 'engine script tag should be appended');
+  assert.match(engineScript.src, /cdn\.jsdelivr\.net.*mc-cart-engine@v1\.0\.0/);
+});
+
+test('bootstrap: snapshot expirado (>7d) é tratado como ausente', async () => {
+  const seedSnap = {
+    v: 1,
+    savedAt: Date.now() - (8 * 24 * 60 * 60 * 1000), // 8 days ago
+    cfg: { cart_mode: 'drawer' },
+    engineFile: 'mc-cart.js',
+  };
+  let beaconCalled = false;
+  let beaconBody = null;
+  const { window, script } = buildDom({
+    dataStoreId: UUID_A,
+    localStorageSeed: { ['mc_cart_snapshot_v1_' + UUID_A]: JSON.stringify(seedSnap) },
+    fetchImpl: () => Promise.resolve({ ok: false, status: 503, text: () => Promise.resolve('') }),
+    sendBeaconImpl: (url, body) => { beaconCalled = true; beaconBody = body; return true; },
+  });
+  runBootstrap(window, script);
+  await flush(window, 50);
+
+  assert.equal(window.mcCartConfig, undefined);
+  assert.equal(beaconCalled, true);
+  const payload = JSON.parse(beaconBody);
+  assert.equal(payload.outcome, 'no_snapshot');
+  assert.equal(payload.storeId, UUID_A);
+});
+
+test('bootstrap: snapshot hit dispara beacon com outcome=snapshot_hit', async () => {
+  const seedSnap = {
+    v: 1,
+    savedAt: Date.now() - 60_000,
+    cfg: { cart_mode: 'native' },
+    engineFile: 'mc-cart-native.js',
+  };
+  let beaconBody = null;
+  const { window, script } = buildDom({
+    dataStoreId: UUID_A,
+    localStorageSeed: { ['mc_cart_snapshot_v1_' + UUID_A]: JSON.stringify(seedSnap) },
+    fetchImpl: () => Promise.reject(new Error('network down')),
+    sendBeaconImpl: (url, body) => { beaconBody = body; return true; },
+  });
+  runBootstrap(window, script);
+  await flush(window, 50);
+
+  assert.ok(beaconBody);
+  const payload = JSON.parse(beaconBody);
+  assert.equal(payload.outcome, 'snapshot_hit');
+  assert.equal(payload.reason, 'network down');
+  assert.equal(payload.snapshotAt, seedSnap.savedAt);
+});
+
+test('bootstrap: timeout 3s força fallback', async () => {
+  // Fetch never resolves
+  let beaconBody = null;
+  const seedSnap = {
+    v: 1, savedAt: Date.now() - 60_000,
+    cfg: { cart_mode: 'drawer' }, engineFile: 'mc-cart.js',
+  };
+  const { window, script } = buildDom({
+    dataStoreId: UUID_A,
+    localStorageSeed: { ['mc_cart_snapshot_v1_' + UUID_A]: JSON.stringify(seedSnap) },
+    fetchImpl: () => new Promise(() => {}),
+    sendBeaconImpl: (url, body) => { beaconBody = body; return true; },
+  });
+  runBootstrap(window, script);
+  // Advance jsdom timers to 3.5s
+  await flush(window, 3500);
+
+  assert.ok(beaconBody);
+  const payload = JSON.parse(beaconBody);
+  assert.equal(payload.reason, 'timeout');
+  assert.equal(payload.outcome, 'snapshot_hit');
+});
