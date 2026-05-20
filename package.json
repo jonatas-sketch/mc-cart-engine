@@ -4,10 +4,13 @@
   "private": false,
   "description": "Public CDN-served mirror of the MC Sync cart engine + bootstrap.",
   "scripts": {
-    "test": "node --test test/**/*.test.mjs"
+    "test": "node --test 'test/**/*.test.mjs'"
   },
   "devDependencies": {
     "jsdom": "^29.1.1"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   },
   "license": "MIT",
   "repository": {
