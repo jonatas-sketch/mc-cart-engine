@@ -185,22 +185,16 @@ test('bootstrap: ?mc_force_fallback=1 pula Railway e vai direto pro fallback', a
     cfg: { cart_mode: 'drawer' }, engineFile: 'mc-cart.js',
   };
   let fetchCalled = false;
-  // Override jsdom URL via dom options
-  const { JSDOM } = await import('jsdom');
-  const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
-    url: 'https://acmestore.example/products/widget?mc_force_fallback=1',
-    runScripts: 'outside-only',
+  let beaconBody = null;
+  const { window, script } = buildDom({
+    dataStoreId: UUID_A,
+    domUrl: 'https://acmestore.example/products/widget?mc_force_fallback=1',
+    localStorageSeed: { ['mc_cart_snapshot_v1_' + UUID_A]: JSON.stringify(seedSnap) },
+    fetchImpl: () => { fetchCalled = true; return Promise.resolve({ ok: true, text: () => Promise.resolve('') }); },
+    sendBeaconImpl: (url, body) => { beaconBody = body; return true; },
   });
-  const { window } = dom;
-  window.localStorage.setItem('mc_cart_snapshot_v1_' + UUID_A, JSON.stringify(seedSnap));
-  window.fetch = () => { fetchCalled = true; return Promise.resolve({ ok: true, text: () => Promise.resolve('') }); };
-  const script = window.document.createElement('script');
-  script.setAttribute('data-store-id', UUID_A);
-  window.document.head.appendChild(script);
-  Object.defineProperty(window.document, 'currentScript', { configurable: true, get: () => script });
-  const src = (await import('node:fs')).readFileSync(new URL('../bootstrap/mc-bootstrap.js', import.meta.url), 'utf-8');
-  window.eval(src);
-  await new Promise((r) => window.setTimeout(r, 30));
+  runBootstrap(window, script);
+  await flush(window, 30);
 
   assert.equal(fetchCalled, false, 'Railway should NOT be called when forced');
   assert.ok(window.__mcCartFallbackMode);

@@ -18,10 +18,11 @@ export function readBootstrapSource() {
  * @param {Record<string, string>} [opts.localStorageSeed] — chaves a popular antes do boot
  * @param {Function} [opts.fetchImpl] — substitui window.fetch
  * @param {Function} [opts.sendBeaconImpl] — substitui navigator.sendBeacon
+ * @param {string} [opts.domUrl] — substitui a URL base do JSDOM (default: products/widget)
  */
-export function buildDom({ dataStoreId, srcFragment, localStorageSeed = {}, fetchImpl, sendBeaconImpl } = {}) {
+export function buildDom({ dataStoreId, srcFragment, localStorageSeed = {}, fetchImpl, sendBeaconImpl, domUrl } = {}) {
   const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
-    url: 'https://acmestore.example/products/widget',
+    url: domUrl || 'https://acmestore.example/products/widget',
     runScripts: 'outside-only',
   });
   const { window } = dom;
@@ -40,6 +41,27 @@ export function buildDom({ dataStoreId, srcFragment, localStorageSeed = {}, fetc
   if (dataStoreId) script.setAttribute('data-store-id', dataStoreId);
   script.setAttribute('src', srcFragment || 'https://cdn.jsdelivr.net/gh/jonatas-sketch/mc-cart-engine@v1.0.0/bootstrap/mc-bootstrap.js');
   window.document.head.appendChild(script);
+
+  // Emulate browser behavior: synchronously execute inline <script> elements
+  // appended to the DOM (jsdom outside-only doesn't do this on its own).
+  // Production code relies on `var s = document.createElement('script'); s.text = jsText; head.appendChild(s)`
+  // to run the script — without this polyfill the loader would never run in tests.
+  // Each buildDom creates a fresh JSDOM with its own HTMLHeadElement.prototype,
+  // so the patch is scoped per fixture instance and does not leak across tests.
+  const origAppendChild = window.HTMLHeadElement.prototype.appendChild;
+  window.HTMLHeadElement.prototype.appendChild = function (node) {
+    const result = origAppendChild.call(this, node);
+    if (
+      node &&
+      node.nodeType === 1 &&
+      node.tagName === 'SCRIPT' &&
+      !node.src &&
+      node.text
+    ) {
+      try { window.eval(node.text); } catch (e) {}
+    }
+    return result;
+  };
 
   // jsdom does not set document.currentScript for scripts whose .text we eval — we'll patch via Object.defineProperty inside runBootstrap.
   return { dom, window, script };
