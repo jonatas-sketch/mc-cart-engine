@@ -51,6 +51,9 @@ export function buildDom({ dataStoreId, srcFragment, localStorageSeed = {}, fetc
   const origAppendChild = window.HTMLHeadElement.prototype.appendChild;
   window.HTMLHeadElement.prototype.appendChild = function (node) {
     const result = origAppendChild.call(this, node);
+    // Only inline <script>.text — external <script src=...> is NOT executed
+    // (jsdom outside-only doesn't fetch them, and the engine bundle is tested
+    // separately). <link rel=stylesheet> appends pass through unchanged.
     if (
       node &&
       node.nodeType === 1 &&

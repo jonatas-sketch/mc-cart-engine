@@ -200,3 +200,31 @@ test('bootstrap: ?mc_force_fallback=1 pula Railway e vai direto pro fallback', a
   assert.ok(window.__mcCartFallbackMode);
   assert.equal(window.__mcCartFallbackMode.reason, 'forced');
 });
+
+test('bootstrap: snapshot LS corrompido (JSON inválido) é tratado como ausente', async () => {
+  let beaconBody = null;
+  const { window, script } = buildDom({
+    dataStoreId: UUID_A,
+    localStorageSeed: { ['mc_cart_snapshot_v1_' + UUID_A]: 'not-json{' },
+    fetchImpl: () => Promise.resolve({ ok: false, status: 503, text: () => Promise.resolve('') }),
+    sendBeaconImpl: (url, body) => { beaconBody = body; return true; },
+  });
+  runBootstrap(window, script);
+  await flush(window, 50);
+
+  assert.equal(window.mcCartConfig, undefined, 'corrupted snapshot must not hydrate mcCartConfig');
+  assert.ok(beaconBody);
+  const payload = JSON.parse(beaconBody);
+  assert.equal(payload.outcome, 'no_snapshot');
+  assert.equal(payload.storeId, UUID_A);
+});
+
+test('fixture: appendChild polyfill is scoped per buildDom (no cross-test leak)', () => {
+  const { window: w1 } = buildDom({ dataStoreId: UUID_A });
+  const { window: w2 } = buildDom({ dataStoreId: UUID_A });
+  assert.notEqual(
+    w1.HTMLHeadElement.prototype.appendChild,
+    w2.HTMLHeadElement.prototype.appendChild,
+    'each buildDom should give a fresh HTMLHeadElement.prototype'
+  );
+});

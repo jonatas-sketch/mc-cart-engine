@@ -10,6 +10,7 @@
   var BEACON_URL      = APP_ORIGIN + '/api/cart-fallback-beacon';
   var TIMEOUT_MS      = 3000;
   var SNAPSHOT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+  var SNAPSHOT_PERSIST_DELAY_MS = 500;  // wait this long after loader injection for window.mcCartConfig to settle
 
   function findStoreId() {
     var cur = document.currentScript;
@@ -58,7 +59,7 @@
       var s = document.createElement('script');
       s.text = jsText;
       document.head.appendChild(s);
-      setTimeout(persistSnapshot, 500);
+      setTimeout(persistSnapshot, SNAPSHOT_PERSIST_DELAY_MS);
     })
     .catch(function (err) {
       clearTimeout(tid);
