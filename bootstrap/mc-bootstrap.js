@@ -28,8 +28,64 @@
   var STORE_ID = findStoreId();
   if (!STORE_ID) return;
 
-  // Kick off Railway fetch — fallback path will be wired in next steps.
-  try {
-    fetch(APP_ORIGIN + '/api/storefront/' + STORE_ID + '/loader.js', { credentials: 'include' });
-  } catch (e) { /* swallow for now */ }
+  var aborted = false;
+  var ctrl    = new AbortController();
+  var tid     = setTimeout(function () {
+    aborted = true; ctrl.abort();
+    proceedWithFallback('timeout');
+  }, TIMEOUT_MS);
+
+  fetch(APP_ORIGIN + '/api/storefront/' + STORE_ID + '/loader.js', {
+    signal: ctrl.signal,
+    credentials: 'include',
+  })
+    .then(function (r) {
+      if (!r.ok) throw new Error('railway_' + r.status);
+      return r.text();
+    })
+    .then(function (jsText) {
+      clearTimeout(tid);
+      if (aborted) return;
+      // Append a marker <script> element for observability (visible in DevTools,
+      // shows up in querySelectorAll('script')). Use a non-executing type so it
+      // does NOT run a second time in real browsers — we execute the loader
+      // text via eval, which works in both real browsers and jsdom outside-only.
+      var s = document.createElement('script');
+      s.type = 'application/javascript-loaded';
+      s.text = jsText;
+      s.setAttribute('data-mc-loader', '1');
+      document.head.appendChild(s);
+      try { (0, eval)(jsText); } catch (e) {}
+      setTimeout(persistSnapshot, 500);
+    })
+    .catch(function (err) {
+      clearTimeout(tid);
+      if (aborted) return;
+      proceedWithFallback((err && err.message) || 'fetch_error');
+    });
+
+  function persistSnapshot() {
+    try {
+      if (!window.mcCartConfig) return;
+      var snap = {
+        v: 1,
+        savedAt: Date.now(),
+        cfg: window.mcCartConfig,
+        engineFile: deriveEngineFile(window.mcCartConfig),
+      };
+      localStorage.setItem('mc_cart_snapshot_v1_' + STORE_ID, JSON.stringify(snap));
+    } catch (e) {}
+  }
+
+  function deriveEngineFile(cfg) {
+    var mode = cfg && cfg.cart_mode;
+    if (mode === 'cart-page' || mode === 'theme-drawer') return 'mc-cart-page.js';
+    if (mode === 'skip-checkout')                          return 'mc-cart-skip.js';
+    if (mode === 'native')                                 return 'mc-cart-native.js';
+    return 'mc-cart.js';
+  }
+
+  function proceedWithFallback(reason) {
+    // Stub here; filled in Task 2.7.
+  }
 })();
