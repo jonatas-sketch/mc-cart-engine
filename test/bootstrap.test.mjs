@@ -178,3 +178,31 @@ test('bootstrap: timeout 3s força fallback', async () => {
   assert.equal(payload.reason, 'timeout');
   assert.equal(payload.outcome, 'snapshot_hit');
 });
+
+test('bootstrap: ?mc_force_fallback=1 pula Railway e vai direto pro fallback', async () => {
+  const seedSnap = {
+    v: 1, savedAt: Date.now() - 60_000,
+    cfg: { cart_mode: 'drawer' }, engineFile: 'mc-cart.js',
+  };
+  let fetchCalled = false;
+  // Override jsdom URL via dom options
+  const { JSDOM } = await import('jsdom');
+  const dom = new JSDOM('<!doctype html><html><head></head><body></body></html>', {
+    url: 'https://acmestore.example/products/widget?mc_force_fallback=1',
+    runScripts: 'outside-only',
+  });
+  const { window } = dom;
+  window.localStorage.setItem('mc_cart_snapshot_v1_' + UUID_A, JSON.stringify(seedSnap));
+  window.fetch = () => { fetchCalled = true; return Promise.resolve({ ok: true, text: () => Promise.resolve('') }); };
+  const script = window.document.createElement('script');
+  script.setAttribute('data-store-id', UUID_A);
+  window.document.head.appendChild(script);
+  Object.defineProperty(window.document, 'currentScript', { configurable: true, get: () => script });
+  const src = (await import('node:fs')).readFileSync(new URL('../bootstrap/mc-bootstrap.js', import.meta.url), 'utf-8');
+  window.eval(src);
+  await new Promise((r) => window.setTimeout(r, 30));
+
+  assert.equal(fetchCalled, false, 'Railway should NOT be called when forced');
+  assert.ok(window.__mcCartFallbackMode);
+  assert.equal(window.__mcCartFallbackMode.reason, 'forced');
+});
