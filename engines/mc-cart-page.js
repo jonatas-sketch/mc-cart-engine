@@ -1,5 +1,5 @@
 /* ============================================================
-   MC Cart Page Engine v1.1
+   MC Cart Page Engine v1.2 — CF override (Fase 1)
    Reads window.mcCartConfig and lets the customer use the theme's
    native /cart page; intercepts the "Finalizar compra" click to
    translate the vitrine cart into a Loja B Storefront cart and
@@ -7,12 +7,21 @@
 
    Spec: docs/superpowers/specs/2026-05-07-cart-modes-and-variant-pairing-design.md §3
    Phase 3.2: full pixel + CAPI + cookie + attribution parity with drawer engine.
+   v1.2: CF checkout override — flag-gated, inert when POOL.cfTargets is unset.
    ============================================================ */
 (function(){
 'use strict';
 
 const C = window.mcCartConfig;
-if (!C || C.cart_mode !== 'cart-page') return;
+// Cart Mode Unification (PR-A, 2026-05-21) — triple-mode boot guard.
+// 'theme-drawer' is the canonical post-migration name.
+// 'cart-page' is legacy: kept during deprecation window so stores still
+//   in cart-page (DB) continue to work until SQL migration moves them.
+// 'skip-checkout' is legacy: kept to cover the 5min loader in-process
+//   cache window after SQL migration — some browsers may still receive
+//   a stale loader emitting cart_mode='skip-checkout' for a few minutes.
+// Future PR-C cleanup will collapse this to just 'theme-drawer'.
+if (!C || (C.cart_mode !== 'theme-drawer' && C.cart_mode !== 'cart-page' && C.cart_mode !== 'skip-checkout')) return;
 
 const POOL = C.pool || { members: [], assigned: null };
 let assignedMember = null;
@@ -400,7 +409,42 @@ async function ensureMemberAssigned(){
       if (!assignedMember) assignedMember = candidates[candidates.length - 1];
     }
   }
-  if (!assignedMember) throw new Error('no_active_pool_member');
+  if (!assignedMember) {
+    // 2026-08-23: the loader can emit members:[] — a DB timeout, a stale CDN
+    // copy, or a store with no pool rows. theme-drawer cannot checkout with an
+    // empty pool, so fall back to the single-checkout credentials on config.
+    //
+    // NOT when POOL.allCapped: that empty pool is intentional — every member
+    // hit its daily sales cap — and falling back would re-open the capped
+    // checkout, defeating the cap the loader just enforced.
+    var legacyMaps = C && C.legacyProductMappings;
+    var temMapa = !!legacyMaps && Object.keys(legacyMaps).length > 0;
+    if (!POOL.allCapped && C && C.domain && C.token && temMapa) {
+      assignedMember = {
+        id: 'legacy-config',
+        domain: C.domain,
+        storefrontToken: C.token,
+        productMappings: legacyMaps,
+        is_primary: true,
+        weight: 1,
+        status: 'active',
+      };
+      // pickCoherentMember() searches POOL.members — NOT `assignedMember`.
+      // Without this push the synthesized member is invisible to it and the
+      // checkout still dies one step later on 'no_member_can_fulfill', which
+      // is exactly how the 2026-08-23 fix looked correct while being inert.
+      if (!Array.isArray(POOL.members)) POOL.members = [];
+      POOL.members.push(assignedMember);
+    } else {
+      // Sem mapa não há last-resort possível: translateLine() devolveria null
+      // para toda linha e o checkout morreria um passo adiante, com um código
+      // enganoso. Falha aqui, nomeada, para o log dizer a verdade.
+      if (!POOL.allCapped && C && C.domain && C.token && !temMapa) {
+        logSystemEvent('mode_a_last_resort_no_mappings', {});
+      }
+      throw new Error('no_active_pool_member');
+    }
+  }
 
   writeCookie('mc_pool_v1', { v: 1, mId: assignedMember.id, exp: Date.now() + 7 * 24 * 3600 * 1000 });
   return assignedMember;
@@ -457,6 +501,76 @@ function pickCoherentMember(lines, members, assignedMemberId){
     if (fulfills(m)) return m;
   }
   return null;
+}
+
+/* ---- ClickFunnels override (Fase 1) — mirrors src/lib/checkout-pool/cf-eligibility.ts ---- */
+function cfPickTarget(cartLines){
+  var cfTargets = POOL.cfTargets;
+  if (!cfTargets || !cartLines || !cartLines.length) return null;
+  var gids = {};
+  for (var i=0;i<cartLines.length;i++){ gids['gid://shopify/Product/'+cartLines[i].productId] = 1; }
+  var keys = Object.keys(gids);
+  if (keys.length !== 1) return null;
+  var target = cfTargets[keys[0]];
+  if (!target || target.capped) return null;
+  var cfLines = [];
+  for (var j=0;j<cartLines.length;j++){
+    var m = target.variantMap[String(cartLines[j].variantId)];
+    if (!m) return null;
+    cfLines.push({ cf_variant_id: m.cf_variant_id, cf_price_id: m.cf_price_id, quantity: cartLines[j].quantity });
+  }
+  return { target: target, cfLines: cfLines };
+}
+function cfCanaryPick(cookie, productId, weight){
+  if (cookie && cookie.pid === productId && (cookie.roll === 'cf' || cookie.roll === 'shopify')) {
+    return { roll: cookie.roll, persist: false };
+  }
+  var roll = (Math.random() * 100 < weight) ? 'cf' : 'shopify';
+  return { roll: roll, persist: true };
+}
+function cfBuildBridgeUrl(target, cfLines, passthrough){
+  var u = new URL(target.bridgeUrl);
+  u.searchParams.set('cf_product_id', String(target.cfProductId));
+  u.searchParams.set('cf_lines', JSON.stringify(cfLines));
+  for (var k in passthrough){
+    if (Object.prototype.hasOwnProperty.call(passthrough, k)) {
+      var v = passthrough[k];
+      if (v != null && v !== '') u.searchParams.set(k, String(v));
+    }
+  }
+  return u.toString();
+}
+// Returns true if it redirected to a CF bridge (caller must `return`).
+function maybeRedirectToCf(vitrineCart){
+  if (!POOL.cfTargets) return false;
+  var picked = cfPickTarget(vitrineCart.lines);
+  if (!picked) return false;
+  var pid = picked.target.vitrineProductId;
+  var cookie = readCookie('mc_cf_v1');
+  var canary = cfCanaryPick(cookie, pid, (picked.target.weight == null ? 0 : picked.target.weight));
+  if (canary.persist) {
+    writeCookie('mc_cf_v1', { v: 1, pid: pid, roll: canary.roll, exp: Date.now() + 7*24*3600*1000 });
+  }
+  if (canary.roll !== 'cf') return false;
+  // best-effort: mark the vitrine cart so the abandoned-cart poller can skip it
+  try { fetch('/cart/update.js', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ attributes: { _mc_cf: '1' } }), keepalive: true }); } catch(e){}
+  // pixel mirror — identical to the permalink branch. total:0 is intentional:
+  // CF's own server-side Purchase carries the real amount.
+  trackEvent('InitiateCheckout', {
+    total: 0,
+    numItems: vitrineCart.totalQuantity,
+    items: vitrineCart.lines.map(function(l){ return { item_id: String(l.variantId), quantity: l.quantity }; }),
+  });
+  var utms = getSavedUTMs() || {};
+  var passthrough = {
+    utm_source: utms.utm_source, utm_medium: utms.utm_medium, utm_campaign: utms.utm_campaign,
+    utm_content: utms.utm_content, utm_term: utms.utm_term,
+    gclid: utms.gclid, fbclid: utms.fbclid, ttclid: utms.ttclid,
+    _fbc: getCookie('_fbc'), _fbp: getCookie('_fbp'), mc_ext_id: getMcExtId(),
+    mc_ab_test_id: window.__mcAbTestId, mc_ab_variant: window.__mcAbVariant,
+  };
+  window.location.href = cfBuildBridgeUrl(picked.target, picked.cfLines, passthrough);
+  return true;
 }
 
 /* ---- Storefront cart create on Loja B (multi-line) ---- */
@@ -542,7 +656,7 @@ function logSystemEvent(code, detail){
     fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ store_id: storeId, code: code, source: 'mc-cart-page', detail: detail || null }),
+      body: JSON.stringify({ storeId: storeId, code: code, source: 'mc-cart-page', detail: detail || null }),
       keepalive: true,
     }).catch(function(){});
   } catch (e) {}
@@ -575,6 +689,13 @@ async function readVitrineCart(){
     note: cart.note || '',
     discount_applications: cart.discount_applications || [],
     cart_level_discount_applications: cart.cart_level_discount_applications || [],
+    // Ajax API (2024+) exposes codes applied to the native cart — via
+    // /discount/CODE or POST /cart/update.js {discount} — as
+    // discount_codes: [{code, applicable}]. The *_discount_applications
+    // entries carry title/value but no `code`, so without this field a
+    // code the customer already sees applied in the vitrine drawer was
+    // silently dropped on the way to the checkout store.
+    discount_codes: Array.isArray(cart.discount_codes) ? cart.discount_codes : [],
   };
 }
 
@@ -640,8 +761,69 @@ function extractNativeDiscountCodes(vitrineCart){
       const a = apps[i];
       if (a && a.code) nativeDiscountCodes.push(a.code);
     }
+    // Codes attached to the native cart (Ajax `discount_codes`). Only the
+    // applicable ones: a non-applicable code would just make the checkout
+    // store's cart reject it.
+    const codes = vitrineCart.discount_codes || [];
+    for (let j = 0; j < codes.length; j++) {
+      const c = codes[j];
+      if (c && c.code && c.applicable !== false && nativeDiscountCodes.indexOf(c.code) === -1) {
+        nativeDiscountCodes.push(c.code);
+      }
+    }
   } catch (e) {}
   return nativeDiscountCodes;
+}
+
+/* A/B: one pool member lands on /checkouts/cn/{token}?skip_shop_pay=true
+   (email first; Shop Pay stays as express). Keep in sync with
+   src/lib/cart-page/skip-shop-pay-url.ts */
+function applySkipShopPayCheckoutUrl(checkoutUrl, member){
+  var testHost = (C.skipShopPayTestHost && String(C.skipShopPayTestHost).trim()) || '';
+  function hostOf(s){
+    return String(s || '').trim().replace(/^https?:\/\//i, '').split('/')[0].toLowerCase();
+  }
+  var want = hostOf(testHost);
+  if (!want || !checkoutUrl) return checkoutUrl;
+  var memberHit = hostOf(member && member.permalinkDomain) === want || hostOf(member && member.domain) === want;
+  try {
+    var u = new URL(checkoutUrl);
+    var urlHit = u.host.toLowerCase() === want;
+    if (!memberHit && !urlHit) return checkoutUrl;
+    var cartMatch = u.pathname.match(/\/cart\/c\/([^/]+)/);
+    var cnMatch = u.pathname.match(/\/checkouts\/cn\/([^/]+)/);
+    var token = (cartMatch && cartMatch[1]) || (cnMatch && cnMatch[1]);
+    if (!token) {
+      u.searchParams.set('skip_shop_pay', 'true');
+      return u.toString();
+    }
+    var dest = hostOf(member && member.permalinkDomain) || (urlHit ? u.host.toLowerCase() : want);
+    return 'https://' + dest + '/checkouts/cn/' + token + '?skip_shop_pay=true';
+  } catch (e) {
+    return checkoutUrl;
+  }
+}
+
+function tagSkipShopPay(checkoutUrl){
+  try {
+    var u = new URL(checkoutUrl, location.href);
+    var pageHost = (location.hostname || '').toLowerCase();
+    if (u.hostname.toLowerCase() === pageHost) return checkoutUrl;
+    if (!u.searchParams.has('skip_shop_pay')) u.searchParams.set('skip_shop_pay', 'true');
+    return u.toString();
+  } catch (e) {
+    return checkoutUrl;
+  }
+}
+
+function goToCheckout(url){
+  try {
+    if (window.top && window.top.location) {
+      window.top.location.replace(url);
+      return;
+    }
+  } catch (e) {}
+  try { window.location.replace(url); } catch (e2) { window.location.href = url; }
 }
 
 /* ---- The core handler: hijack "Finalizar compra" click ---- */
@@ -649,10 +831,16 @@ async function handleCheckoutClick(){
   if (inFlight) return;
   inFlight = true;
   showLoadingOverlay();
+  logSystemEvent('mode_a_checkout_attempt', { pending: !!window.__mcPendingCheckout });
 
   try {
     const vitrineCart = await readVitrineCart();
     if (!vitrineCart.lines.length) throw new Error('cart_empty');
+
+    // ClickFunnels override (Fase 1): evaluate on the final cart BEFORE resolving
+    // a Shopify member, so an eligible CF cart routes even when all Shopify
+    // members are capped, and no Loja-B cartCreate happens when CF wins.
+    if (maybeRedirectToCf(vitrineCart)) return;
 
     await ensureMemberAssigned();
 
@@ -735,7 +923,8 @@ async function handleCheckoutClick(){
         }),
       });
 
-      window.location.href = _permalinkUrl;
+      logSystemEvent('mode_a_checkout_redirect', { host: _permalinkDomain, method: 'permalink' });
+      goToCheckout(tagSkipShopPay(_permalinkUrl));
       return;
     }
 
@@ -776,7 +965,23 @@ async function handleCheckoutClick(){
       }),
     });
 
-    window.location.href = cart.checkoutUrl;
+    var destUrl = tagSkipShopPay(applySkipShopPayCheckoutUrl(cart.checkoutUrl, member));
+    var handoffHost = '';
+    var cartTok = '';
+    try {
+      var _du = new URL(destUrl);
+      handoffHost = _du.host;
+      var _cm = _du.pathname.match(/\/cart\/c\/([^/]+)/) || _du.pathname.match(/\/checkouts\/cn\/([^/]+)/);
+      cartTok = (_cm && _cm[1]) || '';
+    } catch (e) {}
+    logSystemEvent('mode_a_checkout_redirect', {
+      host: handoffHost,
+      skipShopPay: destUrl.indexOf('skip_shop_pay') !== -1,
+      cartToken: cartTok,
+      memberId: member && member.id,
+    });
+
+    goToCheckout(destUrl);
   } catch (err) {
     inFlight = false;
     hideLoadingOverlay();
@@ -791,6 +996,7 @@ async function handleCheckoutClick(){
       return;
     }
     if (code === 'no_active_pool_member') {
+      logSystemEvent('mode_a_checkout_error', { code: code });
       showErrorModal('O checkout está temporariamente indisponível. Tente novamente em instantes.');
       return;
     }
@@ -833,6 +1039,30 @@ function setupATCHook(){
     const url = typeof input === 'string' ? input : (input && input.url) || '';
     const isAtc = url.indexOf('/cart/add.js') !== -1 || url.indexOf('/cart/add') !== -1;
     const isChange = url.indexOf('/cart/change') !== -1 || url.indexOf('/cart/update') !== -1;
+
+    // Cart Mode Unification (PR-A, 2026-05-21) — SKIP PATH for /cart/add.
+    // When themeSkipMode=true, block native ATC entirely (return empty cart
+    // so theme code thinks nothing was added) and let the engine take over
+    // via handleThemeSkipAtc (called inside onAtcDetected).
+    //
+    // We return a Response-like shim (not `new Response(...)`) to keep this
+    // engine forward-compatible with environments where the Fetch API
+    // constructor isn't available globally — themes only need .ok / .status
+    // / .json() / .text() / .clone().
+    if (isAtc && C.themeSkipMode) {
+      try { onAtcDetected(init && init.body).catch(function(){}); } catch (e) {}
+      const emptyCartBody = '{"items":[]}';
+      const shim = {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: function(){ return Promise.resolve({ items: [] }); },
+        text: function(){ return Promise.resolve(emptyCartBody); },
+        clone: function(){ return shim; },
+      };
+      return shim;
+    }
+
     if (isAtc) {
       // Add the gating class BEFORE the native fetch starts; remove in finally
       // so the gate always releases even on network error / abort.
@@ -871,9 +1101,38 @@ function setupATCHook(){
     return response;
   };
 
+  // SKIP PATH: capture-phase click listener to preventDefault BEFORE theme JS runs.
+  // Without this, themes that bind their own click handler (not via form submit)
+  // would still fire native ATC. Mirrors mc-cart-skip.js behavior.
+  if (C.themeSkipMode) {
+    document.addEventListener('click', function(e){
+      const btn = e.target && e.target.closest && e.target.closest(
+        'button[name="add"], input[name="add"], [data-add-to-cart], [data-pf="addtocart"]'
+      );
+      if (!btn) return;
+      const form = btn.closest && btn.closest('form');
+      if (!form || !form.matches || !form.matches('form[action*="/cart/add"], form[action="/cart"]')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+      try {
+        const fd = new FormData(form);
+        onAtcDetected(fd).catch(function(){});
+      } catch (e) {}
+    }, true);
+  }
+
   document.addEventListener('submit', function(e){
     const form = e.target;
     if (form && form.matches && form.matches('form[action*="/cart/add"]')) {
+      // SKIP PATH: preventDefault so the form never posts to /cart/add and
+      // the theme never sees the new line. Engine handles cartCreate +
+      // redirect via handleThemeSkipAtc.
+      if (C.themeSkipMode) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+      }
       try {
         const fd = new FormData(form);
         onAtcDetected(fd).catch(function(){});
@@ -901,8 +1160,9 @@ async function onAtcDetected(body){
     }
   } catch (e) {}
 
-  // Try to enrich with product data (name + price)
-  let name = '', price = 0;
+  // Try to enrich with product data (name + price + sku + selectedOptions)
+  // sku + selectedOptions are required for skip-path variant translation.
+  let name = '', price = 0, sku = null, selectedOptions = [];
   if (variantId && location.pathname.match(/^\/products\//)) {
     try {
       const handle = location.pathname.split('/products/')[1].split(/[\/?#]/)[0];
@@ -915,6 +1175,12 @@ async function onAtcDetected(body){
         for (let i = 0; i < variants.length; i++) {
           if (String(variants[i].id) === String(variantId)) {
             price = (variants[i].price || 0) / 100; // /products/X.js price is in cents
+            sku = variants[i].sku || null;
+            if (Array.isArray(pData.options) && Array.isArray(variants[i].options)) {
+              selectedOptions = pData.options.map(function(n, idx){
+                return { name: n, value: variants[i].options[idx] };
+              });
+            }
             break;
           }
         }
@@ -922,6 +1188,26 @@ async function onAtcDetected(body){
     } catch (e) {}
   }
 
+  // Cart Mode Unification (PR-A, 2026-05-21) — SKIP PATH.
+  // When themeSkipMode=true, don't let the cart drawer/page of the theme
+  // see this line. Translate variant → cartCreate Loja B → redirect.
+  if (C.themeSkipMode) {
+    let productId = null;
+    if (window.ShopifyAnalytics && window.ShopifyAnalytics.meta && window.ShopifyAnalytics.meta.product) {
+      productId = window.ShopifyAnalytics.meta.product.id;
+    }
+    return handleThemeSkipAtc({
+      variantId: variantId,
+      quantity: quantity,
+      name: name,
+      price: price,
+      sku: sku,
+      selectedOptions: selectedOptions,
+      productId: productId,
+    });
+  }
+
+  // NORMAL PATH (theme-drawer + theme handles cart UX) — observe only.
   try { await ensureMemberAssigned(); } catch (e) {}
 
   if (variantId) {
@@ -933,6 +1219,58 @@ async function onAtcDetected(body){
     });
   }
 }
+
+/* ---- Theme-skip handler (Cart Mode Unification PR-A) ----
+   Replaces the standalone mc-cart-skip.js engine. Activated when
+   cart_mode='theme-drawer' AND themeSkipMode=true.
+   Flow: resolve pool member → translate variant → cartCreate Loja B →
+   fire pixels (AddToCart + InitiateCheckout) → redirect to checkoutUrl. */
+async function handleThemeSkipAtc(opts){
+  if (window.__mcSkipInFlight) return;
+  window.__mcSkipInFlight = true;
+  showLoadingOverlay();
+  try {
+    const member = await ensureMemberAssigned();
+    if (!member) throw new Error('no_active_pool_member');
+    if (!opts.productId) throw new Error('no_product_id');
+
+    const lojaBVariantGid = translateLine({
+      productId: opts.productId,
+      variantId: opts.variantId,
+      sku: opts.sku,
+      selectedOptions: opts.selectedOptions,
+    }, member);
+    if (!lojaBVariantGid) throw new Error('cant_translate');
+
+    const cart = await createLojaBCart(member, [{
+      merchandiseId: lojaBVariantGid,
+      quantity: opts.quantity || 1,
+    }], { autoDiscount: C.autoDiscount });
+
+    trackEvent('AddToCart', {
+      variantId: String(opts.variantId),
+      name: opts.name,
+      price: opts.price,
+      qty: opts.quantity,
+    });
+    trackEvent('InitiateCheckout', {
+      total: cart && cart.cost && cart.cost.totalAmount && cart.cost.totalAmount.amount,
+      qty: opts.quantity,
+    });
+
+    goToCheckout(tagSkipShopPay(cart.checkoutUrl));
+  } catch (err) {
+    window.__mcSkipInFlight = false;
+    hideLoadingOverlay();
+    try { console.error('[MC Theme-Skip] error:', err && err.message); } catch (e) {}
+    try { alert('Não conseguimos finalizar agora. Recarregue a página e tente novamente.'); } catch (e) {}
+  }
+}
+
+// NOTE: showLoadingOverlay / hideLoadingOverlay are defined above (line ~511)
+// and shared between the Checkout-click hijack and the theme-skip ATC path.
+// They use ID `mc-page-overlay` and respect `C.cartPageLoadingText` for opt-in
+// label. The skip path benefits from the same subtle UX automatically.
 
 /* ---- Checkout-button hijack (capture-phase, document-level) ---- */
 function setupCheckoutHooks(){
@@ -1038,6 +1376,10 @@ window.addEventListener('pageshow', function(event){
    cold pageload, especially after a rapid ATC of an upsell) bypasses the
    capture-phase listener entirely and lands on the Vitrine /checkout. */
 window.__mcCartReady = true;
+if (window.__mcPendingCheckout) {
+  window.__mcPendingCheckout = false;
+  handleCheckoutClick();
+}
 
 console.log('[MC Page] engine v1.2 loaded for store ' + (window.__mcStoreId || ''));
 })();

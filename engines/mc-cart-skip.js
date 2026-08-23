@@ -71,7 +71,30 @@ async function ensureMemberAssigned(){
       if (!assignedMember) assignedMember = candidates[candidates.length - 1];
     }
   }
-  if (!assignedMember) throw new Error('no_active_pool_member');
+  if (!assignedMember) {
+    // 2026-08-23: same last-resort as mc-cart-page.js — empty pool must
+    // not hard-fail when the loader already put checkout credentials on C,
+    // but an `allCapped` empty pool is intentional and must be respected.
+    var legacyMaps = C && C.legacyProductMappings;
+    var temMapa = !!legacyMaps && Object.keys(legacyMaps).length > 0;
+    // Sem mapa o member sintetizado nao traduz nada — melhor nao existir.
+    if (!POOL.allCapped && C && C.domain && C.token && temMapa) {
+      assignedMember = {
+        id: 'legacy-config',
+        domain: C.domain,
+        storefrontToken: C.token,
+        productMappings: legacyMaps,
+        is_primary: true,
+        weight: 1,
+        status: 'active',
+      };
+      // Must live in POOL.members — that is the array pickCoherentMember reads.
+      if (!Array.isArray(POOL.members)) POOL.members = [];
+      POOL.members.push(assignedMember);
+    } else {
+      throw new Error('no_active_pool_member');
+    }
+  }
 
   writeCookie('mc_pool_v1', { v: 1, mId: assignedMember.id, exp: Date.now() + 7*24*3600*1000 });
   return assignedMember;
