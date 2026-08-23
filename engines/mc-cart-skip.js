@@ -71,7 +71,22 @@ async function ensureMemberAssigned(){
       if (!assignedMember) assignedMember = candidates[candidates.length - 1];
     }
   }
-  if (!assignedMember) throw new Error('no_active_pool_member');
+  if (!assignedMember) {
+    // 2026-08-23: same last-resort as mc-cart-page.js — empty pool must
+    // not hard-fail when the loader already put checkout credentials on C.
+    if (C && C.domain && C.token) {
+      assignedMember = {
+        id: 'legacy-config',
+        domain: C.domain,
+        storefrontToken: C.token,
+        productMappings: C.legacyProductMappings || {},
+        is_primary: true,
+        weight: 1,
+      };
+    } else {
+      throw new Error('no_active_pool_member');
+    }
+  }
 
   writeCookie('mc_pool_v1', { v: 1, mId: assignedMember.id, exp: Date.now() + 7*24*3600*1000 });
   return assignedMember;
