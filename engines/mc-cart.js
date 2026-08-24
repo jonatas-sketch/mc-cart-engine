@@ -729,6 +729,37 @@ function getCookie(name){try{const m=document.cookie.match(new RegExp('(^| )'+na
 function setCookie(name,value,maxAgeDays){try{document.cookie=name+'='+value+';path=/;max-age='+(maxAgeDays*86400)+';SameSite=Lax';}catch(e){}}
 function genEventId(){return Date.now().toString(36)+'.'+Math.random().toString(36).substr(2,8);}
 
+/* ---- Stable order-event id for /api/track idempotency ----
+   Espelha a regra de src/lib/ingest/client-event-id.ts (fonte testável).
+   Devolve um id ESTÁVEL por carrinho: re-firar o checkout do MESMO carrinho
+   (retry do keepalive, clique duplo, reload + novo checkout) reusa o id e o
+   backend deduplica; carrinhos diferentes recebem ids diferentes e NUNCA
+   colapsam dois pedidos legítimos. Persistido em sessionStorage p/ sobreviver a
+   reload, e LIMPO após o checkout (ver mcCheckout) — o cartId persiste no
+   localStorage e não é zerado pela compra, então um 2º checkout do mesmo cart
+   na mesma sessão deve gerar id novo, não reusar o anterior.
+   Inócuo com a flag INGEST_DEDUPE_ENABLED OFF: o backend ignora o campo.
+   cartId nulo → sempre id novo (sem carrinho não há "mesmo evento" a deduplicar). */
+function mcEventTokenNew(){
+  try{ if(window.crypto&&window.crypto.randomUUID) return window.crypto.randomUUID(); }catch(e){}
+  return Date.now().toString(36)+'.'+Math.random().toString(36).slice(2,12);
+}
+function mcCheckoutEventId(cartId){
+  var key = (typeof cartId==='string') ? cartId.trim() : '';
+  if(!key) return mcEventTokenNew();
+  var sk = 'mc_evt:'+key;
+  try{
+    var existing = sessionStorage.getItem(sk);
+    if(existing) return existing;
+    var fresh = mcEventTokenNew();
+    sessionStorage.setItem(sk, fresh);
+    return fresh;
+  }catch(e){
+    // sessionStorage indisponível (modo privado/quota): id novo, sem persistir.
+    return mcEventTokenNew();
+  }
+}
+
 /* ---- External ID (persistent anonymous identifier for Meta matching) ---- */
 function getMcExtId(){
   let id = getCookie('_mc_ext_id');
@@ -1305,8 +1336,11 @@ function renderRewards(subtotal){
     // append the remaining amount automatically so the customer always
     // sees how much is left ("Spend $50 more to get free shipping").
     const tierText = activeTier.text || '';
-    if(tierText.indexOf('{AMOUNT}') >= 0){
-      text = tierText.replace('{AMOUNT}', '<b>'+CUR+' '+fmt(remaining)+'</b>');
+    // Token substitution is case-insensitive + global so a merchant typing
+    // {amount}, {Amount} or using it twice still renders — engine placeholder
+    // contract (the dashboard hint at cart/rewards announces {AMOUNT}).
+    if(/\{amount\}/i.test(tierText)){
+      text = tierText.replace(/\{amount\}/gi, '<b>'+CUR+' '+fmt(remaining)+'</b>');
     } else {
       text = esc(tierText) + ' <b>('+CUR+' '+fmt(remaining)+' to go)</b>';
     }
@@ -1559,11 +1593,39 @@ async function addLine(variantId, qty=1){
     syncLines(cart.lines.edges);
     return cart;
   } catch (err) {
-    console.warn('MC Cart: cartLinesAdd failed, recreating cart on active member', err && err.message);
+    var msg = (err && err.message) || '';
+    // 2026-08-23 — antes, QUALQUER erro aqui destruía o carrinho do cliente e
+    // recriava com apenas o item novo: blip de rede, 429 de throttle, 5xx,
+    // timeout, userError de estoque. Quem tinha 4 itens e adicionava o quinto
+    // durante um soluço da Shopify ficava com um carrinho de 1 item, em
+    // silêncio — só um console.warn. O ticket médio despencava e nada
+    // registrava o motivo.
+    if (!mcDeveRecriarCarrinho(msg)) {
+      console.warn('MC Cart: cartLinesAdd falhou (transitório), carrinho preservado —', msg);
+      throw err; // o chamador já trata; melhor não adicionar do que perder tudo
+    }
+    console.warn('MC Cart: carrinho pertence a outra loja, recriando —', msg);
     cartId = null;
     try { localStorage.removeItem('mc_cartId'); } catch(e) { /* noop */ }
     return createCart(variantId, qty);
   }
+}
+
+/**
+ * Só um carrinho comprovadamente morto justifica descartar o do cliente.
+ *
+ * `cart_stale_on_member` é o erro que o próprio addLine lança quando
+ * `cartLinesAdd` devolve `cart` nulo — sinal de que o cartId pertence a outra
+ * loja. Fora isso, aceitamos apenas mensagens da Shopify que digam
+ * explicitamente que o carrinho não existe mais.
+ *
+ * Tudo o mais é transitório e preservar é o correto: não adicionar um item é
+ * um problema pequeno; perder o carrinho inteiro é uma venda.
+ */
+function mcDeveRecriarCarrinho(msg){
+  if (!msg) return false;
+  if (msg === 'cart_stale_on_member') return true;
+  return /\bcart\b[\s\S]{0,40}?(not found|does not exist|no longer|invalid)|(invalid|unknown)\s+cart\b/i.test(msg);
 }
 
 async function updateLine(lineId, qty){
@@ -2071,8 +2133,15 @@ window.mcCheckout = async function(){
       currency:getCurrencyCode(),
       items:cartLines.map(l=>({item_id:l.variantId,item_name:l.title,price:parseFloat(l.price),quantity:l.qty}))
     });
-    // MC Sync order tracking (fire-and-forget)
-    if(window.__mcStoreId&&window.__mcTrackUrl){try{fetch(window.__mcTrackUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({storeId:window.__mcStoreId,cartId:cartId,subtotal:subtotal,currency:getCurrencyCode(),itemCount:cartLines.reduce((s,l)=>s+l.qty,0),utms:getSavedUTMs(),referrer:document.referrer||''}),keepalive:true}).catch(()=>{});}catch(e){}}
+    // MC Sync order tracking (fire-and-forget). event_id = id estável por
+    // carrinho p/ idempotência do /api/track (deduplica retries; inócuo com a
+    // flag off). Gerado ANTES do 1º envio e reusado nos reenvios do mesmo cart.
+    if(window.__mcStoreId&&window.__mcTrackUrl){try{var mcEvtId=mcCheckoutEventId(cartId);fetch(window.__mcTrackUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({storeId:window.__mcStoreId,event_id:mcEvtId,cartId:cartId,subtotal:subtotal,currency:getCurrencyCode(),itemCount:cartLines.reduce((s,l)=>s+l.qty,0),utms:getSavedUTMs(),referrer:document.referrer||''}),keepalive:true}).catch(()=>{});
+      // Limpa o id do evento após o disparo do checkout: o cartId persiste no
+      // localStorage e não é zerado pela compra; sem isto um 2º checkout do MESMO
+      // cartId na mesma sessão reusaria o id e (flag on) o 2º pedido distinto
+      // seria deduplicado/perdido. Removendo, um novo checkout gera id novo.
+      try{ sessionStorage.removeItem('mc_evt:'+cartId); }catch(e){}}catch(e){}}
     // A/B checkout event
     if(window.__mcAbTestId&&window.__mcStoreId&&window.__mcTrackUrl){try{fetch(window.__mcTrackUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({storeId:window.__mcStoreId,ab_test_id:window.__mcAbTestId,ab_variant:window.__mcAbVariant,ab_visitor_id:window.__mcAbVisitorId,ab_event:'checkout'}),keepalive:true}).catch(()=>{});}catch(e){}}
     // Use location.href instead of window.open to avoid popup blockers on mobile
@@ -2096,6 +2165,11 @@ function renderPageVariants(productGid){
   const options = pageProductData.options || [];
   const variants = pageProductData.variants || [];
   if(!options.length || (options.length===1 && options[0].values.length<=1)) return;
+
+  // Semeia TODAS as opções antes de renderizar. O laço abaixo pula as de valor
+  // único, então elas nunca entrariam em pageSelectedOptions — e é isso que
+  // fazia getSelectedVariant() não casar nenhuma variante.
+  mcSeedDefaultOptions(options, pageSelectedOptions);
 
   containers.forEach(container => {
     let html = '<div class="mc-page-variants">';
@@ -2147,10 +2221,31 @@ function updatePageProductDisplay(){
   document.querySelectorAll('[data-mc-image]').forEach(el=>{if(match.image?.url) el.src=match.image.url;});
 }
 
+// 2026-08-23 — semeia o default de TODA opção, inclusive as de valor único.
+// renderPageVariants() pula essas (`if(opt.values.length <= 1) return;`) porque
+// não há o que escolher, e por isso nunca as semeava. Só que
+// getSelectedVariant() casa pelo conjunto COMPLETO de selectedOptions da
+// variante: uma opção não semeada faz `undefined === 'One Size'` e derruba o
+// .every() de todas as variantes. O cliente clicava Vermelho e comprava Preto.
+function mcSeedDefaultOptions(options, selected){
+  (options||[]).forEach(function(opt){
+    if(!opt || !opt.name || !opt.values || !opt.values.length) return;
+    if(selected[opt.name] === undefined) selected[opt.name] = opt.values[0];
+  });
+  return selected;
+}
+
 function getSelectedVariant(){
   if(!pageProductData) return null;
   const variants = pageProductData.variants || [];
-  return variants.find(v=>v.selectedOptions.every(so=>pageSelectedOptions[so.name]===so.value)) || variants[0];
+  mcSeedDefaultOptions(pageProductData.options, pageSelectedOptions);
+  const match = variants.find(v=>v.selectedOptions.every(so=>pageSelectedOptions[so.name]===so.value));
+  if(match) return match;
+  // Sem correspondência exata. O `|| variants[0]` que estava aqui é como o
+  // cliente acabava pagando por uma variante que não escolheu. Só devolve a
+  // única variante quando de fato não há escolha a fazer.
+  if(variants.length === 1) return variants[0];
+  return null;
 }
 
 window.mcPageSelectOption = function(optName, optValue, productGid){
