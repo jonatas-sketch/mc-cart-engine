@@ -17,6 +17,25 @@ function getCookie(name){
   var m = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
   return m ? decodeURIComponent(m[2]) : null;
 }
+/* ---- fbclid CRU (2026-08-26) ----
+   A Meta acusou "Server sending modified fbclid value in fbc parameter":
+   63 conjuntos de anuncios, R$ 44.610 de investimento afetado, atingindo
+   Purchase, ViewContent e AddToCart.
+
+   `URLSearchParams.get('fbclid')` DECODIFICA percent-encoding e troca `+` por
+   espaco. A Meta espera o valor exatamente como veio na URL. */
+function mcFbclidCru(){
+  try {
+    var q = String(window.location.search || '').replace(/^\?/, '');
+    if (!q) return '';
+    var partes = q.split('&');
+    for (var i = 0; i < partes.length; i++) {
+      if (partes[i].indexOf('fbclid=') === 0) return partes[i].slice(7);
+    }
+  } catch (e) {}
+  return '';
+}
+
 function setCookie(name, value, days){
   var maxAge = (days || 365) * 24 * 3600;
   document.cookie = name + '=' + encodeURIComponent(value) + ';path=/;max-age=' + maxAge + ';SameSite=Lax';
@@ -34,9 +53,10 @@ function uuid(){
 function rewriteAttributionCookies(){
   try {
     var u = new URL(location.href);
-    var fbclid = u.searchParams.get('fbclid');
+    var fbclid = mcFbclidCru();
     var gclid  = u.searchParams.get('gclid');
-    if (fbclid) setCookie('_fbc', 'fb.1.' + Date.now() + '.' + fbclid, 90);
+    // ⛔ nao sobrescrever o _fbc do fbevents.js (timestamp do clique)
+    if (fbclid && !getCookie('_fbc')) setCookie('_fbc', 'fb.1.' + Date.now() + '.' + fbclid, 90);
     if (gclid)  setCookie('_mc_gclid', gclid, 90);
     if (!getCookie('_mc_ext_id')) setCookie('_mc_ext_id', uuid(), 365);
   } catch (e) { /* best effort */ }
@@ -251,16 +271,126 @@ function parseAtcBody(body){
   return result;
 }
 
-function onAtcSuccess(body){
-  var parsed = parseAtcBody(body);
-  if (!parsed.variantId) return;
+/* ---- Dedupe de add-to-cart (2026-08-24) ----
+   Dois caminhos observam o ATC: o wrapper de `fetch` e o listener de `submit`.
+   A maioria dos temas dispara OS DOIS (emite submit, da preventDefault, chama
+   fetch), e cada acao fisica virava dois AddToCart.
+
+   ⛔ O caminho do fetch espera `res.ok` — so conta adicao que DEU CERTO. Uma
+   dedupe de "o primeiro vence" faria o submit (que dispara na hora, sem
+   confirmar nada) ganhar do caminho bom. Por isso o submit AGENDA em vez de
+   contar, e o fetch cancela o agendamento assim que aparece:
+
+     submit  -> agenda
+     fetch   -> cancela o agendado; conta so se res.ok
+     sem fetch (XHR/jQuery) -> o agendado dispara e cobre
+     POST nativo -> a pagina navega; `pagehide` descarrega o agendado antes
+
+   Mapa por chave, nao slot unico: duas variantes diferentes na mesma janela
+   sao duas adicoes de verdade. */
+var MC_ATC_ESPERA_MS = 1200;
+var MC_ATC_JANELA_MS = 1500;
+var _mcAtcContado = {};
+var _mcAtcPendente = {};
+
+/* A resposta do /cart/add.js traz o item adicionado com `price` em centavos,
+   `product_id` e `variant_id`. E a fonte certa do valor: nao custa requisicao
+   extra e acerta inclusive o produto RECOMENDADO na PDP — caso em que buscar
+   por handle da URL falha, porque a variante nao pertence ao produto da pagina.
+
+   ⚠️ Ler sempre de um clone. Consumir o corpo original deixa o tema sem nada
+   para ler e quebra o carrinho da loja. */
+function mcEnriquecerComResposta(base, corpo){
+  if (!base || !corpo) return base;
+  try {
+    var itens = corpo.items || (corpo.id ? [corpo] : []);
+    var alvo = null;
+    for (var i = 0; i < itens.length; i++) {
+      var vid = itens[i].variant_id || itens[i].id;
+      if (String(vid) === String(base.variantId)) { alvo = itens[i]; break; }
+    }
+    if (!alvo && itens.length === 1) alvo = itens[0];
+    if (!alvo) return base;
+    return {
+      variantId: base.variantId,
+      quantity: base.quantity,
+      productId: alvo.product_id || base.productId,
+      // `price` e o unitario em centavos; `line_price` seria o total da linha.
+      price: (alvo.price || 0) / 100,
+      name: alvo.product_title || alvo.title || base.name || ''
+    };
+  } catch (e) { return base; }
+}
+
+function mcChaveAtc(parsed){
+  return String(parsed.variantId) + 'x' + String(parsed.quantity);
+}
+
+function mcPodarAtc(){
+  var agora = Date.now();
+  for (var k in _mcAtcContado) {
+    if (agora - _mcAtcContado[k] > MC_ATC_JANELA_MS) delete _mcAtcContado[k];
+  }
+}
+
+function mcCancelarPendente(chave){
+  var p = _mcAtcPendente[chave];
+  if (p) {
+    clearTimeout(p.timer);
+    delete _mcAtcPendente[chave];
+  }
+}
+
+function mcContarAtc(parsed){
+  if (!parsed || !parsed.variantId) return;
+  var chave = mcChaveAtc(parsed);
+  var agora = Date.now();
+  mcPodarAtc();
+  if (_mcAtcContado[chave] && (agora - _mcAtcContado[chave]) < MC_ATC_JANELA_MS) return;
+  _mcAtcContado[chave] = agora;
+  mcCancelarPendente(chave);
   trackEvent('AddToCart', {
     variantId: parsed.variantId,
+    name: parsed.name || '',
     content_ids: [String(parsed.productId || parsed.variantId)],
     content_type: 'product',
-    value: 0,
+    // 2026-08-24: era `0` fixo. Toda adicao chegava na Meta valendo zero,
+    // cegando otimizacao por valor. Agora vem da resposta do /cart/add.js.
+    value: parsed.price || 0,
     quantity: parsed.quantity
   });
+}
+
+function mcAgendarAtc(parsed){
+  if (!parsed || !parsed.variantId) return;
+  var chave = mcChaveAtc(parsed);
+  if (_mcAtcPendente[chave]) return;
+  if (_mcAtcContado[chave] && (Date.now() - _mcAtcContado[chave]) < MC_ATC_JANELA_MS) return;
+  // Guarda o dado JUNTO do timer: a descarga do `pagehide` precisa saber o que
+  // contar, e um id de timer sozinho nao diz nada.
+  _mcAtcPendente[chave] = {
+    parsed: parsed,
+    timer: setTimeout(function(){
+      delete _mcAtcPendente[chave];
+      mcContarAtc(parsed);
+    }, MC_ATC_ESPERA_MS)
+  };
+}
+
+/* POST nativo navega antes do timer. Descarrega o que estiver agendado. */
+function mcDescarregarPendentes(){
+  var chaves = Object.keys(_mcAtcPendente);
+  for (var i = 0; i < chaves.length; i++) {
+    var p = _mcAtcPendente[chaves[i]];
+    if (!p) continue;
+    clearTimeout(p.timer);
+    delete _mcAtcPendente[chaves[i]];
+    mcContarAtc(p.parsed);
+  }
+}
+
+function onAtcSuccess(body){
+  mcContarAtc(parseAtcBody(body));
 }
 
 /* ---- Fetch wrap — observe-only, never blocks ---- */
@@ -272,12 +402,30 @@ function setupATCHook(){
       url = typeof input === 'string' ? input : (input && input.url) || '';
     } catch (e) {}
     var isAtc = url.indexOf('/cart/add.js') !== -1 || url.indexOf('/cart/add') !== -1;
+    var parsedAqui = null;
+    if (isAtc) {
+      // O fetch e autoritativo: existindo, ele decide. Cancela o agendamento
+      // que o submit deixou, inclusive quando a resposta for erro — adicao que
+      // falhou nao pode virar AddToCart pela porta dos fundos.
+      try {
+        parsedAqui = parseAtcBody(init && init.body);
+        if (parsedAqui && parsedAqui.variantId) mcCancelarPendente(mcChaveAtc(parsedAqui));
+      } catch (e) {}
+    }
     var promise = _fetch.apply(this, arguments);
     if (isAtc) {
       promise.then(function(res){
-        if (res && res.ok) {
-          try { onAtcSuccess(init && init.body); } catch (e) {}
-        }
+        if (!(res && res.ok)) return;
+        var base;
+        try { base = parsedAqui || parseAtcBody(init && init.body); } catch (e) { return; }
+        var lendo = null;
+        try {
+          if (typeof res.clone === 'function') lendo = res.clone().json();
+        } catch (e) { lendo = null; }
+        if (!lendo || typeof lendo.then !== 'function') { mcContarAtc(base); return; }
+        lendo.then(function(corpo){
+          mcContarAtc(mcEnriquecerComResposta(base, corpo));
+        }).catch(function(){ mcContarAtc(base); });
       }).catch(function(){});
     }
     return promise;
@@ -288,11 +436,15 @@ function setupATCHook(){
     var form = e.target;
     if (form && form.matches && form.matches('form[action*="/cart/add"]')) {
       try {
-        var fd = new FormData(form);
-        onAtcSuccess(fd);
+        mcAgendarAtc(parseAtcBody(new FormData(form)));
       } catch (err) {}
     }
   }, true);
+
+  // POST nativo faz a pagina navegar antes do timer vencer. Sem isto, tema
+  // sem AJAX perderia o AddToCart inteiro.
+  window.addEventListener('pagehide', mcDescarregarPendentes);
+  window.addEventListener('beforeunload', mcDescarregarPendentes);
 }
 
 /* ---- Checkout click hook — observe-only, never preventDefault ---- */
