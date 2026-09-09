@@ -3,11 +3,33 @@
    Reads window.mcCartConfig and renders a full cart drawer
    using Shopify Storefront API.
    ============================================================ */
+/* ---- fbclid CRU (2026-08-26) ----
+   A Meta acusou "Server sending modified fbclid value in fbc parameter":
+   63 conjuntos de anuncios, R$ 44.610 de investimento afetado, atingindo
+   Purchase, ViewContent e AddToCart.
+
+   `URLSearchParams.get('fbclid')` DECODIFICA percent-encoding e troca `+` por
+   espaco. A Meta espera o valor exatamente como veio na URL. */
+function mcFbclidCru(){
+  try {
+    var q = String(window.location.search || '').replace(/^\?/, '');
+    if (!q) return '';
+    var partes = q.split('&');
+    for (var i = 0; i < partes.length; i++) {
+      if (partes[i].indexOf('fbclid=') === 0) return partes[i].slice(7);
+    }
+  } catch (e) {}
+  return '';
+}
+
 (function(){
 'use strict';
 
 const C = window.mcCartConfig;
 if (!C) return console.error('MC Cart: window.mcCartConfig not found');
+/* Flags do bloco multi-pixel (ver 'Multi-pixel da Meta' abaixo). drawer: aditivo — inicializa os configurados e mantem o broadcast; SDK vem do tema/app/buildPixelScripts. */
+var MC_META_NOMEAR_DESTINO = false;
+var MC_META_CARREGAR_SDK = false;
 
 /* ---- Checkout Pool (Phase 1 — spec § 9.2) ----
    The loader emits window.mcCartConfig.pool = { assigned, members, availability }.
@@ -653,6 +675,80 @@ const esc = s => {const d=document.createElement('div');d.textContent=s||'';retu
 const fmt = n => parseFloat(n).toFixed(2);
 
 /* ---- Tracking ---- */
+/* ---- Multi-pixel da Meta (2026-09-09) ----
+   O loader emite `metaPixelIds` (principal primeiro; so ids, nunca token).
+   Cada pixel configurado e inicializado UMA vez. O que acontece depois
+   depende de dois flags definidos no boot de cada engine:
+     MC_META_NOMEAR_DESTINO — true: cada evento sai por `trackSingle` para
+       CADA pixel (page engine, desenho de #461: o evento nomeia o pixel das
+       campanhas). false: `fbq(verbo)` de sempre, que alcanca os pixels
+       inicializados — os configurados E qualquer outro que tema/app tenha
+       inicializado (drawer/native/skip: aditivo, ninguem deixa de receber).
+     MC_META_CARREGAR_SDK — true: injeta fbevents.js quando nao ha fbq
+       (page engine, #462). false: sem fbq na pagina nada e disparado, como
+       sempre foi nesses engines (consentimento fica com o tema/CMP).
+   O mesmo eventID vai a todo pixel — e ele que casa com o CAPI, que o relay
+   abre em leque para os mesmos pixels. Loader antigo em cache (so `pxMeta`)
+   continua valendo: um pixel.
+   Bloco IDENTICO nos 4 engines — ha teste de paridade textual
+   (multi-pixel-nos-engines.test.ts). Edite os quatro juntos. */
+/* MC:META-MULTIPIXEL:INICIO */
+function mcMetaPixelIds(){
+  var ids = [];
+  try {
+    var lista = Array.isArray(C.metaPixelIds) ? C.metaPixelIds : (C.pxMeta ? [C.pxMeta] : []);
+    for (var i = 0; i < lista.length; i++) {
+      var id = String(lista[i] || '').trim();
+      if (id && ids.indexOf(id) === -1) ids.push(id);
+    }
+  } catch (e) {}
+  return ids;
+}
+
+/* O snippet oficial da Meta se auto-protege (`if(f.fbq)return;`): inerte
+   enquanto outro app/tema carregou o SDK, assume quando ele sair. */
+function mcGarantirSdkMeta(w){
+  try {
+    if (!MC_META_CARREGAR_SDK) return;
+    if (w.fbq) return;                    // app/tema/GTM ja carregou; nao substituir
+    if (!mcMetaPixelIds().length) return; // sem pixel configurado nao ha o que carregar
+    /* eslint-disable */
+    (function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+    n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;
+    n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
+    t.src=v;s=b.getElementsByTagName(e)[0];
+    if(s&&s.parentNode){s.parentNode.insertBefore(t,s);}else{(b.head||b.documentElement).appendChild(t);}
+    })(w,document,'script','https://connect.facebook.net/en_US/fbevents.js');
+    /* eslint-enable */
+  } catch (e) {}
+}
+
+var _mcPixelsInicializados = {};
+
+function mcEnviarFbq(w, verbo, evento, dados, opts){
+  mcGarantirSdkMeta(w);
+  if (!w.fbq) return;
+  var ids = mcMetaPixelIds();
+  for (var i = 0; i < ids.length; i++) {
+    if (!_mcPixelsInicializados[ids[i]]) {
+      /* Marca SO se o init nao lancou; senao tenta de novo no proximo evento. */
+      try { w.fbq('init', ids[i]); _mcPixelsInicializados[ids[i]] = true; } catch (e) {}
+    }
+  }
+  /* Cada chamada protegida: um pixel que lance nao pode derrubar os demais
+     nem o GA4/TikTok/CAPI do mesmo evento (o trackEvent tem um try so). */
+  if (ids.length && MC_META_NOMEAR_DESTINO) {
+    /* trackSingle nomeia o destino; exige o init acima (sem ele o evento some). */
+    var verboUnico = verbo === 'trackCustom' ? 'trackSingleCustom' : 'trackSingle';
+    for (var j = 0; j < ids.length; j++) {
+      try { w.fbq(verboUnico, ids[j], evento, dados, opts); } catch (e) {}
+    }
+    return;
+  }
+  try { w.fbq(verbo, evento, dados, opts); } catch (e) {}
+}
+/* MC:META-MULTIPIXEL:FIM */
+
 function trackEvent(eventName, data){
   try{
     const cur = getCurrencyCode();
@@ -660,13 +756,15 @@ function trackEvent(eventName, data){
     const found = [];
     // Gerar event_id unico para deduplicacao browser + server
     const eventId = genEventId();
-    // Meta Pixel (fbq) — com eventID para deduplicar com CAPI
+    // Meta Pixel (fbq) — com eventID para deduplicar com CAPI. Com pixel
+    // configurado, `mcEnviarFbq` nomeia cada pixel (trackSingle); sem, `track`.
+    mcGarantirSdkMeta(w);
     if(w.fbq && typeof w.fbq==='function'){
       found.push('fbq');
-      if(eventName==='ViewContent') w.fbq('track','ViewContent',{content_ids:data.contentIds||[],content_type:'product',content_name:data.name||'',value:parseFloat(data.price)||0,currency:cur},{eventID:eventId});
-      else if(eventName==='AddToCart') w.fbq('track','AddToCart',{content_name:data.name,content_ids:[data.variantId],content_type:'product',value:parseFloat(data.price),currency:cur,num_items:data.qty||1},{eventID:eventId});
-      else if(eventName==='InitiateCheckout') w.fbq('track','InitiateCheckout',{value:parseFloat(data.total),currency:cur,num_items:data.numItems,content_type:'product'},{eventID:eventId});
-      else if(eventName==='RemoveFromCart') w.fbq('trackCustom','RemoveFromCart',{content_name:data.name,content_ids:[data.variantId],content_type:'product'},{eventID:eventId});
+      if(eventName==='ViewContent') mcEnviarFbq(w,'track','ViewContent',{content_ids:data.contentIds||[],content_type:'product',content_name:data.name||'',value:parseFloat(data.price)||0,currency:cur},{eventID:eventId});
+      else if(eventName==='AddToCart') mcEnviarFbq(w,'track','AddToCart',{content_name:data.name,content_ids:[data.variantId],content_type:'product',value:parseFloat(data.price),currency:cur,num_items:data.qty||1},{eventID:eventId});
+      else if(eventName==='InitiateCheckout') mcEnviarFbq(w,'track','InitiateCheckout',{value:parseFloat(data.total),currency:cur,num_items:data.numItems,content_type:'product'},{eventID:eventId});
+      else if(eventName==='RemoveFromCart') mcEnviarFbq(w,'trackCustom','RemoveFromCart',{content_name:data.name,content_ids:[data.variantId],content_type:'product'},{eventID:eventId});
     }
     // Google Analytics 4 (gtag)
     if(w.gtag && typeof w.gtag==='function'){
@@ -729,6 +827,37 @@ function getCookie(name){try{const m=document.cookie.match(new RegExp('(^| )'+na
 function setCookie(name,value,maxAgeDays){try{document.cookie=name+'='+value+';path=/;max-age='+(maxAgeDays*86400)+';SameSite=Lax';}catch(e){}}
 function genEventId(){return Date.now().toString(36)+'.'+Math.random().toString(36).substr(2,8);}
 
+/* ---- Stable order-event id for /api/track idempotency ----
+   Espelha a regra de src/lib/ingest/client-event-id.ts (fonte testável).
+   Devolve um id ESTÁVEL por carrinho: re-firar o checkout do MESMO carrinho
+   (retry do keepalive, clique duplo, reload + novo checkout) reusa o id e o
+   backend deduplica; carrinhos diferentes recebem ids diferentes e NUNCA
+   colapsam dois pedidos legítimos. Persistido em sessionStorage p/ sobreviver a
+   reload, e LIMPO após o checkout (ver mcCheckout) — o cartId persiste no
+   localStorage e não é zerado pela compra, então um 2º checkout do mesmo cart
+   na mesma sessão deve gerar id novo, não reusar o anterior.
+   Inócuo com a flag INGEST_DEDUPE_ENABLED OFF: o backend ignora o campo.
+   cartId nulo → sempre id novo (sem carrinho não há "mesmo evento" a deduplicar). */
+function mcEventTokenNew(){
+  try{ if(window.crypto&&window.crypto.randomUUID) return window.crypto.randomUUID(); }catch(e){}
+  return Date.now().toString(36)+'.'+Math.random().toString(36).slice(2,12);
+}
+function mcCheckoutEventId(cartId){
+  var key = (typeof cartId==='string') ? cartId.trim() : '';
+  if(!key) return mcEventTokenNew();
+  var sk = 'mc_evt:'+key;
+  try{
+    var existing = sessionStorage.getItem(sk);
+    if(existing) return existing;
+    var fresh = mcEventTokenNew();
+    sessionStorage.setItem(sk, fresh);
+    return fresh;
+  }catch(e){
+    // sessionStorage indisponível (modo privado/quota): id novo, sem persistir.
+    return mcEventTokenNew();
+  }
+}
+
 /* ---- External ID (persistent anonymous identifier for Meta matching) ---- */
 function getMcExtId(){
   let id = getCookie('_mc_ext_id');
@@ -743,11 +872,10 @@ const mcExtId = getMcExtId();
 /* ---- First-Party FBC Cookie (survives Safari ITP) ---- */
 (function persistFbc(){
   try{
-    const p = new URLSearchParams(window.location.search);
-    const fbclid = p.get('fbclid');
-    if(fbclid){
-      const fbc = 'fb.1.'+Date.now()+'.'+fbclid;
-      setCookie('_fbc', fbc, 90);
+    var fbclid = mcFbclidCru();
+    // ⛔ nao sobrescrever o _fbc do fbevents.js (timestamp do clique)
+    if(fbclid && !getCookie('_fbc')){
+      setCookie('_fbc', 'fb.1.'+Date.now()+'.'+fbclid, 90);
     }
   }catch(e){}
 })();
@@ -778,15 +906,15 @@ if(C.gadsConversionId){
 function sendCAPI(eventName, data, cur, eventId){
   try{
     // Map event names to Meta standard events
-    const metaEventMap = {ViewContent:'ViewContent',AddToCart:'AddToCart',InitiateCheckout:'InitiateCheckout',RemoveFromCart:'RemoveFromCart'};
+    const metaEventMap = {PageView:'PageView',ViewContent:'ViewContent',AddToCart:'AddToCart',InitiateCheckout:'InitiateCheckout',RemoveFromCart:'RemoveFromCart'};
     const metaEvent = metaEventMap[eventName];
     if(!metaEvent) return;
 
     if(!eventId) eventId = genEventId();
     const fbp = getCookie('_fbp');
     const fbc = getCookie('_fbc') || (function(){
-      const p = new URLSearchParams(window.location.search);
-      const fbclid = p.get('fbclid');
+      // fbclid CRU: URLSearchParams decodifica e este fbc vai direto no evento CAPI (fix #469)
+      const fbclid = mcFbclidCru();
       if(fbclid) return 'fb.1.'+Date.now()+'.'+fbclid;
       return '';
     })();
@@ -839,10 +967,21 @@ function sendCAPI(eventName, data, cur, eventId){
       body: JSON.stringify(payload),
       keepalive: true,
     }).then(r=>r.json()).then(res=>{
-      if(res.success) console.log('%c[MC CAPI]%c '+metaEvent+' sent ✓ (events_received: '+res.events_received+')', 'background:#1877F2;color:#fff;padding:2px 6px;border-radius:3px','color:#1877F2');
-      else console.warn('[MC CAPI] Error:', res);
+      if(res.success){
+        console.log('%c[MC CAPI]%c '+metaEvent+' sent ✓ (events_received: '+res.events_received+')', 'background:#1877F2;color:#fff;padding:2px 6px;border-radius:3px','color:#1877F2');
+        if(res.pixels_failed) console.warn('[MC CAPI] '+metaEvent+': '+res.pixels_failed+' pixel(s) recusaram — confira o token no painel (Tracking → Meta → testar)');
+      } else console.warn('[MC CAPI] Error:', res);
     }).catch(e=>console.warn('[MC CAPI] Network error:', e.message));
   }catch(e){console.warn('[MC CAPI] Error:', e);}
+}
+
+try {
+  if (!sessionStorage.getItem('_mc_landing')) {
+    sessionStorage.setItem('_mc_landing', window.location.href);
+  }
+} catch (e) {}
+if (C.capiEndpoint) {
+  sendCAPI('PageView', {}, C.currencyCode || 'USD', window.__mcPvEventId);
 }
 
 /* ---- UTM Capture ---- */
@@ -851,7 +990,9 @@ function getUTMs(){
     const params = new URLSearchParams(window.location.search);
     const utms = {};
     ['utm_source','utm_medium','utm_campaign','utm_content','utm_term','gclid','fbclid','ttclid','ref','msclkid','li_fat_id','mc_cid','mc_eid'].forEach(k=>{
-      const v = params.get(k);
+      // fbclid nunca via URLSearchParams: ela decodifica, e este valor vira
+      // note_attributes → fbc do Purchase no servidor (fix #469)
+      const v = (k==='fbclid') ? mcFbclidCru() : params.get(k);
       if(v) utms[k] = v;
     });
     // Capture _ga cookie for GA cross-domain
@@ -1305,8 +1446,11 @@ function renderRewards(subtotal){
     // append the remaining amount automatically so the customer always
     // sees how much is left ("Spend $50 more to get free shipping").
     const tierText = activeTier.text || '';
-    if(tierText.indexOf('{AMOUNT}') >= 0){
-      text = tierText.replace('{AMOUNT}', '<b>'+CUR+' '+fmt(remaining)+'</b>');
+    // Token substitution is case-insensitive + global so a merchant typing
+    // {amount}, {Amount} or using it twice still renders — engine placeholder
+    // contract (the dashboard hint at cart/rewards announces {AMOUNT}).
+    if(/\{amount\}/i.test(tierText)){
+      text = tierText.replace(/\{amount\}/gi, '<b>'+CUR+' '+fmt(remaining)+'</b>');
     } else {
       text = esc(tierText) + ' <b>('+CUR+' '+fmt(remaining)+' to go)</b>';
     }
@@ -1559,11 +1703,39 @@ async function addLine(variantId, qty=1){
     syncLines(cart.lines.edges);
     return cart;
   } catch (err) {
-    console.warn('MC Cart: cartLinesAdd failed, recreating cart on active member', err && err.message);
+    var msg = (err && err.message) || '';
+    // 2026-08-23 — antes, QUALQUER erro aqui destruía o carrinho do cliente e
+    // recriava com apenas o item novo: blip de rede, 429 de throttle, 5xx,
+    // timeout, userError de estoque. Quem tinha 4 itens e adicionava o quinto
+    // durante um soluço da Shopify ficava com um carrinho de 1 item, em
+    // silêncio — só um console.warn. O ticket médio despencava e nada
+    // registrava o motivo.
+    if (!mcDeveRecriarCarrinho(msg)) {
+      console.warn('MC Cart: cartLinesAdd falhou (transitório), carrinho preservado —', msg);
+      throw err; // o chamador já trata; melhor não adicionar do que perder tudo
+    }
+    console.warn('MC Cart: carrinho pertence a outra loja, recriando —', msg);
     cartId = null;
     try { localStorage.removeItem('mc_cartId'); } catch(e) { /* noop */ }
     return createCart(variantId, qty);
   }
+}
+
+/**
+ * Só um carrinho comprovadamente morto justifica descartar o do cliente.
+ *
+ * `cart_stale_on_member` é o erro que o próprio addLine lança quando
+ * `cartLinesAdd` devolve `cart` nulo — sinal de que o cartId pertence a outra
+ * loja. Fora isso, aceitamos apenas mensagens da Shopify que digam
+ * explicitamente que o carrinho não existe mais.
+ *
+ * Tudo o mais é transitório e preservar é o correto: não adicionar um item é
+ * um problema pequeno; perder o carrinho inteiro é uma venda.
+ */
+function mcDeveRecriarCarrinho(msg){
+  if (!msg) return false;
+  if (msg === 'cart_stale_on_member') return true;
+  return /\bcart\b[\s\S]{0,40}?(not found|does not exist|no longer|invalid)|(invalid|unknown)\s+cart\b/i.test(msg);
 }
 
 async function updateLine(lineId, qty){
@@ -2022,6 +2194,10 @@ window.mcCheckout = async function(){
     attributes.push({key:'_mc_ext_id',value:mcExtId});
     const _fbc = getCookie('_fbc'); if(_fbc) attributes.push({key:'_fbc',value:_fbc});
     const _fbp = getCookie('_fbp'); if(_fbp) attributes.push({key:'_fbp',value:_fbp});
+    try {
+      const landing = sessionStorage.getItem('_mc_landing') || window.location.href;
+      if (landing) attributes.push({ key: '_mc_landing', value: landing });
+    } catch (e) {}
     // A/B test attributes for purchase attribution (flow through to order note_attributes)
     if(window.__mcAbTestId){
       attributes.push({key:'_mc_ab_variant',value:window.__mcAbVariant});
@@ -2071,8 +2247,15 @@ window.mcCheckout = async function(){
       currency:getCurrencyCode(),
       items:cartLines.map(l=>({item_id:l.variantId,item_name:l.title,price:parseFloat(l.price),quantity:l.qty}))
     });
-    // MC Sync order tracking (fire-and-forget)
-    if(window.__mcStoreId&&window.__mcTrackUrl){try{fetch(window.__mcTrackUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({storeId:window.__mcStoreId,cartId:cartId,subtotal:subtotal,currency:getCurrencyCode(),itemCount:cartLines.reduce((s,l)=>s+l.qty,0),utms:getSavedUTMs(),referrer:document.referrer||''}),keepalive:true}).catch(()=>{});}catch(e){}}
+    // MC Sync order tracking (fire-and-forget). event_id = id estável por
+    // carrinho p/ idempotência do /api/track (deduplica retries; inócuo com a
+    // flag off). Gerado ANTES do 1º envio e reusado nos reenvios do mesmo cart.
+    if(window.__mcStoreId&&window.__mcTrackUrl){try{var mcEvtId=mcCheckoutEventId(cartId);fetch(window.__mcTrackUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({storeId:window.__mcStoreId,event_id:mcEvtId,cartId:cartId,subtotal:subtotal,currency:getCurrencyCode(),itemCount:cartLines.reduce((s,l)=>s+l.qty,0),utms:getSavedUTMs(),referrer:document.referrer||''}),keepalive:true}).catch(()=>{});
+      // Limpa o id do evento após o disparo do checkout: o cartId persiste no
+      // localStorage e não é zerado pela compra; sem isto um 2º checkout do MESMO
+      // cartId na mesma sessão reusaria o id e (flag on) o 2º pedido distinto
+      // seria deduplicado/perdido. Removendo, um novo checkout gera id novo.
+      try{ sessionStorage.removeItem('mc_evt:'+cartId); }catch(e){}}catch(e){}}
     // A/B checkout event
     if(window.__mcAbTestId&&window.__mcStoreId&&window.__mcTrackUrl){try{fetch(window.__mcTrackUrl,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({storeId:window.__mcStoreId,ab_test_id:window.__mcAbTestId,ab_variant:window.__mcAbVariant,ab_visitor_id:window.__mcAbVisitorId,ab_event:'checkout'}),keepalive:true}).catch(()=>{});}catch(e){}}
     // Use location.href instead of window.open to avoid popup blockers on mobile
@@ -2096,6 +2279,11 @@ function renderPageVariants(productGid){
   const options = pageProductData.options || [];
   const variants = pageProductData.variants || [];
   if(!options.length || (options.length===1 && options[0].values.length<=1)) return;
+
+  // Semeia TODAS as opções antes de renderizar. O laço abaixo pula as de valor
+  // único, então elas nunca entrariam em pageSelectedOptions — e é isso que
+  // fazia getSelectedVariant() não casar nenhuma variante.
+  mcSeedDefaultOptions(options, pageSelectedOptions);
 
   containers.forEach(container => {
     let html = '<div class="mc-page-variants">';
@@ -2147,10 +2335,31 @@ function updatePageProductDisplay(){
   document.querySelectorAll('[data-mc-image]').forEach(el=>{if(match.image?.url) el.src=match.image.url;});
 }
 
+// 2026-08-23 — semeia o default de TODA opção, inclusive as de valor único.
+// renderPageVariants() pula essas (`if(opt.values.length <= 1) return;`) porque
+// não há o que escolher, e por isso nunca as semeava. Só que
+// getSelectedVariant() casa pelo conjunto COMPLETO de selectedOptions da
+// variante: uma opção não semeada faz `undefined === 'One Size'` e derruba o
+// .every() de todas as variantes. O cliente clicava Vermelho e comprava Preto.
+function mcSeedDefaultOptions(options, selected){
+  (options||[]).forEach(function(opt){
+    if(!opt || !opt.name || !opt.values || !opt.values.length) return;
+    if(selected[opt.name] === undefined) selected[opt.name] = opt.values[0];
+  });
+  return selected;
+}
+
 function getSelectedVariant(){
   if(!pageProductData) return null;
   const variants = pageProductData.variants || [];
-  return variants.find(v=>v.selectedOptions.every(so=>pageSelectedOptions[so.name]===so.value)) || variants[0];
+  mcSeedDefaultOptions(pageProductData.options, pageSelectedOptions);
+  const match = variants.find(v=>v.selectedOptions.every(so=>pageSelectedOptions[so.name]===so.value));
+  if(match) return match;
+  // Sem correspondência exata. O `|| variants[0]` que estava aqui é como o
+  // cliente acabava pagando por uma variante que não escolheu. Só devolve a
+  // única variante quando de fato não há escolha a fazer.
+  if(variants.length === 1) return variants[0];
+  return null;
 }
 
 window.mcPageSelectOption = function(optName, optValue, productGid){
