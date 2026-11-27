@@ -11,12 +11,34 @@
 
 var C = window.mcCartConfig;
 if (!C || C.cart_mode !== 'native') return;
+/* Flags do bloco multi-pixel (ver 'Multi-pixel da Meta' abaixo). native: a vitrine E o checkout; o pixel da loja e do tema/app — aditivo, sem injetar SDK. */
+var MC_META_NOMEAR_DESTINO = false;
+var MC_META_CARREGAR_SDK = false;
 
 /* ---- Cookie helpers (mirrors mc-cart.js patterns) ---- */
 function getCookie(name){
   var m = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
   return m ? decodeURIComponent(m[2]) : null;
 }
+/* ---- fbclid CRU (2026-08-26) ----
+   A Meta acusou "Server sending modified fbclid value in fbc parameter":
+   63 conjuntos de anuncios, R$ 44.610 de investimento afetado, atingindo
+   Purchase, ViewContent e AddToCart.
+
+   `URLSearchParams.get('fbclid')` DECODIFICA percent-encoding e troca `+` por
+   espaco. A Meta espera o valor exatamente como veio na URL. */
+function mcFbclidCru(){
+  try {
+    var q = String(window.location.search || '').replace(/^\?/, '');
+    if (!q) return '';
+    var partes = q.split('&');
+    for (var i = 0; i < partes.length; i++) {
+      if (partes[i].indexOf('fbclid=') === 0) return partes[i].slice(7);
+    }
+  } catch (e) {}
+  return '';
+}
+
 function setCookie(name, value, days){
   var maxAge = (days || 365) * 24 * 3600;
   document.cookie = name + '=' + encodeURIComponent(value) + ';path=/;max-age=' + maxAge + ';SameSite=Lax';
@@ -34,9 +56,10 @@ function uuid(){
 function rewriteAttributionCookies(){
   try {
     var u = new URL(location.href);
-    var fbclid = u.searchParams.get('fbclid');
+    var fbclid = mcFbclidCru();
     var gclid  = u.searchParams.get('gclid');
-    if (fbclid) setCookie('_fbc', 'fb.1.' + Date.now() + '.' + fbclid, 90);
+    // ⛔ nao sobrescrever o _fbc do fbevents.js (timestamp do clique)
+    if (fbclid && !getCookie('_fbc')) setCookie('_fbc', 'fb.1.' + Date.now() + '.' + fbclid, 90);
     if (gclid)  setCookie('_mc_gclid', gclid, 90);
     if (!getCookie('_mc_ext_id')) setCookie('_mc_ext_id', uuid(), 365);
   } catch (e) { /* best effort */ }
@@ -71,7 +94,9 @@ function captureAttributionToCart(){
       var v = u.searchParams.get(params[i]);
       if (v) attrs[params[i]] = v;
     }
-    var fbclid = u.searchParams.get('fbclid');
+    // fbclid CRU (fix #469): searchParams decodifica; este attr vira
+    // note_attributes → fbc do Purchase no servidor
+    var fbclid = mcFbclidCru();
     var gclid  = u.searchParams.get('gclid');
     if (fbclid) attrs.fbclid = fbclid;
     if (gclid)  attrs.gclid  = gclid;
@@ -99,12 +124,179 @@ function captureAttributionToCart(){
   } catch (e) { /* swallow */ }
 }
 
+/* ---- Multi-pixel da Meta (2026-09-09) ----
+   O loader emite `metaPixelIds` (principal primeiro; so ids, nunca token).
+   Cada pixel configurado e inicializado UMA vez. O que acontece depois
+   depende de dois flags definidos no boot de cada engine:
+     MC_META_NOMEAR_DESTINO — true: cada evento sai por `trackSingle` para
+       CADA pixel (page engine, desenho de #461: o evento nomeia o pixel das
+       campanhas). false: `fbq(verbo)` de sempre, que alcanca os pixels
+       inicializados — os configurados E qualquer outro que tema/app tenha
+       inicializado (drawer/native/skip: aditivo, ninguem deixa de receber).
+     MC_META_CARREGAR_SDK — true: injeta fbevents.js quando nao ha fbq
+       (page engine, #462). false: sem fbq na pagina nada e disparado, como
+       sempre foi nesses engines (consentimento fica com o tema/CMP).
+   O mesmo eventID vai a todo pixel — e ele que casa com o CAPI, que o relay
+   abre em leque para os mesmos pixels. Loader antigo em cache (so `pxMeta`)
+   continua valendo: um pixel.
+   Bloco IDENTICO nos 4 engines — ha teste de paridade textual
+   (multi-pixel-nos-engines.test.ts). Edite os quatro juntos. */
+/* MC:META-MULTIPIXEL:INICIO */
+function mcMetaPixelIds(){
+  var ids = [];
+  try {
+    var lista = Array.isArray(C.metaPixelIds) ? C.metaPixelIds : (C.pxMeta ? [C.pxMeta] : []);
+    for (var i = 0; i < lista.length; i++) {
+      var id = String(lista[i] || '').trim();
+      if (id && ids.indexOf(id) === -1) ids.push(id);
+    }
+  } catch (e) {}
+  return ids;
+}
+
+/* O snippet oficial da Meta se auto-protege (`if(f.fbq)return;`): inerte
+   enquanto outro app/tema carregou o SDK, assume quando ele sair. */
+function mcGarantirSdkMeta(w){
+  try {
+    if (!MC_META_CARREGAR_SDK) return;
+    if (w.fbq) return;                    // app/tema/GTM ja carregou; nao substituir
+    if (!mcMetaPixelIds().length) return; // sem pixel configurado nao ha o que carregar
+    /* eslint-disable */
+    (function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+    n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;
+    n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
+    t.src=v;s=b.getElementsByTagName(e)[0];
+    if(s&&s.parentNode){s.parentNode.insertBefore(t,s);}else{(b.head||b.documentElement).appendChild(t);}
+    })(w,document,'script','https://connect.facebook.net/en_US/fbevents.js');
+    /* eslint-enable */
+  } catch (e) {}
+}
+
+var _mcPixelsInicializados = {};
+
+function mcEnviarFbq(w, verbo, evento, dados, opts){
+  mcGarantirSdkMeta(w);
+  if (!w.fbq) return;
+  var ids = mcMetaPixelIds();
+  for (var i = 0; i < ids.length; i++) {
+    if (!_mcPixelsInicializados[ids[i]]) {
+      /* Marca SO se o init nao lancou; senao tenta de novo no proximo evento. */
+      try { w.fbq('init', ids[i]); _mcPixelsInicializados[ids[i]] = true; } catch (e) {}
+    }
+  }
+  /* Cada chamada protegida: um pixel que lance nao pode derrubar os demais
+     nem o GA4/TikTok/CAPI do mesmo evento (o trackEvent tem um try so). */
+  if (ids.length && MC_META_NOMEAR_DESTINO) {
+    /* trackSingle nomeia o destino; exige o init acima (sem ele o evento some). */
+    var verboUnico = verbo === 'trackCustom' ? 'trackSingleCustom' : 'trackSingle';
+    for (var j = 0; j < ids.length; j++) {
+      try { w.fbq(verboUnico, ids[j], evento, dados, opts); } catch (e) {}
+    }
+    return;
+  }
+  try { w.fbq(verbo, evento, dados, opts); } catch (e) {}
+}
+/* MC:META-MULTIPIXEL:FIM */
+
 /* ---- Pixel + CAPI firing (mirrors mc-cart.js patterns) ---- */
 function gaEventName(name){
   if (name === 'AddToCart')        return 'add_to_cart';
   if (name === 'InitiateCheckout') return 'begin_checkout';
   if (name === 'ViewContent')      return 'view_item';
   return name;
+}
+
+/* ---- Meta Conversions API (server-side) ----
+   Contrato do relay /api/capi/[storeId] — o MESMO do sendCAPI de
+   mc-cart-page.js e mc-cart.js:
+     { events: [{ event_name, event_id, source_url, fbc, fbp, external_id,
+                  custom_data, user_data }] }
+   (zod capiEventSchema, allow-list de eventos, ate 20 por lote.)
+
+   Ate 2026-09-09 este engine postava um corpo plano
+   ({ event_name, event_id, ..., payload, page_url }) a `C._capiEndpoint` ou
+   '/api/capi/' + C.storeId — chaves que o loader NUNCA emite (ele emite
+   `capiEndpoint`, sem underscore, e o storeId vai em window.__mcStoreId).
+   Resultado: o native nunca chamou o relay; e se chamasse, o relay
+   responderia 400 "No events". A resposta era ignorada (.catch sem .then).
+   Registrado como nao-objetivo no spec do multi-pixel (§3.4).
+
+   O eventId e o mesmo passado ao fbq — e ele que faz a Meta casar navegador
+   e servidor. custom_data espelha o que o pixel deste engine recebe (mesmo
+   content_ids), para os dois canais contarem a mesma coisa.
+
+   ⚠️ O zod do relay (`.optional()`) RECUSA null. O getCookie daqui devolve
+   null para cookie ausente (o do page/drawer devolve ''), entao todo campo
+   de cookie cai para '' — senao o evento inteiro e descartado no servidor. */
+function sendCAPI(eventName, payload, cur, eventId){
+  try {
+    var metaEventMap = { PageView: 'PageView', ViewContent: 'ViewContent', AddToCart: 'AddToCart', InitiateCheckout: 'InitiateCheckout', RemoveFromCart: 'RemoveFromCart' };
+    var metaEvent = metaEventMap[eventName];
+    if (!metaEvent) return;
+    payload = payload || {};
+    if (!eventId) eventId = uuid();
+
+    var fbp = getCookie('_fbp') || '';
+    var fbc = getCookie('_fbc') || (function(){
+      // fbclid CRU (fix #469): URLSearchParams decodifica; este fbc vai direto no evento CAPI
+      var fbclid = mcFbclidCru();
+      if (fbclid) return 'fb.1.' + Date.now() + '.' + fbclid;
+      return '';
+    })();
+    var contentIds = payload.content_ids || (payload.variantId ? [String(payload.variantId)] : []);
+
+    var custom_data = {};
+    if (eventName === 'ViewContent') {
+      custom_data = {
+        content_ids: contentIds,
+        content_type: 'product',
+        content_name: payload.name || '',
+        value: parseFloat(payload.value || 0),
+        currency: cur
+      };
+    } else if (eventName === 'AddToCart') {
+      custom_data = {
+        value: parseFloat(payload.value || 0),
+        currency: cur,
+        content_ids: contentIds,
+        content_name: payload.name || '',
+        content_type: 'product',
+        num_items: payload.quantity || 1
+      };
+    } else if (eventName === 'InitiateCheckout') {
+      custom_data = {
+        value: parseFloat(payload.value || 0),
+        currency: cur,
+        num_items: payload.num_items || 0,
+        content_type: 'product'
+      };
+    }
+
+    var body = {
+      events: [{
+        event_name: metaEvent,
+        event_id: eventId,
+        source_url: location.href,
+        fbc: fbc,
+        fbp: fbp,
+        external_id: getCookie('_mc_ext_id') || '',
+        custom_data: custom_data,
+        user_data: {}
+      }]
+    };
+
+    fetch(C.capiEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      keepalive: true
+    }).then(function(r){ return r.json(); }).then(function(res){
+      if (res && res.success) {
+        console.log('[MC Native CAPI] ' + metaEvent + ' sent ok (events_received: ' + res.events_received + ')');
+        if (res.pixels_failed) console.warn('[MC Native CAPI] ' + metaEvent + ': ' + res.pixels_failed + ' pixel(s) recusaram — confira o token no painel (Tracking → Meta → testar)');
+      } else console.warn('[MC Native CAPI] Error:', res);
+    }).catch(function(e){ console.warn('[MC Native CAPI] Network error:', e && e.message); });
+  } catch (e) { console.warn('[MC Native CAPI] Error:', e); }
 }
 
 function trackEvent(eventName, payload){
@@ -114,6 +306,7 @@ function trackEvent(eventName, payload){
     payload = payload || {};
 
     /* Browser pixels — synchronous queue, flushed by browser on unload */
+    mcGarantirSdkMeta(window);
     if (window.fbq) {
       var fbPayload = {
         currency: cur,
@@ -122,7 +315,7 @@ function trackEvent(eventName, payload){
         value: parseFloat(payload.value || 0),
         num_items: payload.quantity || payload.num_items
       };
-      window.fbq('track', eventName, fbPayload, { eventID: eventId });
+      mcEnviarFbq(window, 'track', eventName, fbPayload, { eventID: eventId });
     }
     if (window.gtag) {
       var gaPayload = {
@@ -148,29 +341,10 @@ function trackEvent(eventName, payload){
       });
     }
 
-    /* CAPI server-side — async, keepalive survives page unload */
-    if (C.capiToken || C.pxMeta) {
-      var capiUrl = C._capiEndpoint;
-      if (!capiUrl && C.storeId) {
-        capiUrl = '/api/capi/' + C.storeId;
-      }
-      if (capiUrl) {
-        fetch(capiUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            event_name: eventName,
-            event_id: eventId,
-            external_id: getCookie('_mc_ext_id'),
-            fbc: getCookie('_fbc'),
-            fbp: getCookie('_fbp'),
-            payload: payload,
-            page_url: location.href
-          }),
-          keepalive: true
-        }).catch(function(){});
-      }
-    }
+    /* CAPI server-side — async, keepalive survives page unload.
+       Gate: `C.capiEndpoint`, que e o que o loader emite quando ha pixel com
+       token. O corpo e montado em sendCAPI, no contrato do relay. */
+    if (C.capiEndpoint) sendCAPI(eventName, payload, cur, eventId);
   } catch (e) {
     console.warn('[MC Native] trackEvent error', e);
   }
@@ -251,16 +425,126 @@ function parseAtcBody(body){
   return result;
 }
 
-function onAtcSuccess(body){
-  var parsed = parseAtcBody(body);
-  if (!parsed.variantId) return;
+/* ---- Dedupe de add-to-cart (2026-08-24) ----
+   Dois caminhos observam o ATC: o wrapper de `fetch` e o listener de `submit`.
+   A maioria dos temas dispara OS DOIS (emite submit, da preventDefault, chama
+   fetch), e cada acao fisica virava dois AddToCart.
+
+   ⛔ O caminho do fetch espera `res.ok` — so conta adicao que DEU CERTO. Uma
+   dedupe de "o primeiro vence" faria o submit (que dispara na hora, sem
+   confirmar nada) ganhar do caminho bom. Por isso o submit AGENDA em vez de
+   contar, e o fetch cancela o agendamento assim que aparece:
+
+     submit  -> agenda
+     fetch   -> cancela o agendado; conta so se res.ok
+     sem fetch (XHR/jQuery) -> o agendado dispara e cobre
+     POST nativo -> a pagina navega; `pagehide` descarrega o agendado antes
+
+   Mapa por chave, nao slot unico: duas variantes diferentes na mesma janela
+   sao duas adicoes de verdade. */
+var MC_ATC_ESPERA_MS = 1200;
+var MC_ATC_JANELA_MS = 1500;
+var _mcAtcContado = {};
+var _mcAtcPendente = {};
+
+/* A resposta do /cart/add.js traz o item adicionado com `price` em centavos,
+   `product_id` e `variant_id`. E a fonte certa do valor: nao custa requisicao
+   extra e acerta inclusive o produto RECOMENDADO na PDP — caso em que buscar
+   por handle da URL falha, porque a variante nao pertence ao produto da pagina.
+
+   ⚠️ Ler sempre de um clone. Consumir o corpo original deixa o tema sem nada
+   para ler e quebra o carrinho da loja. */
+function mcEnriquecerComResposta(base, corpo){
+  if (!base || !corpo) return base;
+  try {
+    var itens = corpo.items || (corpo.id ? [corpo] : []);
+    var alvo = null;
+    for (var i = 0; i < itens.length; i++) {
+      var vid = itens[i].variant_id || itens[i].id;
+      if (String(vid) === String(base.variantId)) { alvo = itens[i]; break; }
+    }
+    if (!alvo && itens.length === 1) alvo = itens[0];
+    if (!alvo) return base;
+    return {
+      variantId: base.variantId,
+      quantity: base.quantity,
+      productId: alvo.product_id || base.productId,
+      // `price` e o unitario em centavos; `line_price` seria o total da linha.
+      price: (alvo.price || 0) / 100,
+      name: alvo.product_title || alvo.title || base.name || ''
+    };
+  } catch (e) { return base; }
+}
+
+function mcChaveAtc(parsed){
+  return String(parsed.variantId) + 'x' + String(parsed.quantity);
+}
+
+function mcPodarAtc(){
+  var agora = Date.now();
+  for (var k in _mcAtcContado) {
+    if (agora - _mcAtcContado[k] > MC_ATC_JANELA_MS) delete _mcAtcContado[k];
+  }
+}
+
+function mcCancelarPendente(chave){
+  var p = _mcAtcPendente[chave];
+  if (p) {
+    clearTimeout(p.timer);
+    delete _mcAtcPendente[chave];
+  }
+}
+
+function mcContarAtc(parsed){
+  if (!parsed || !parsed.variantId) return;
+  var chave = mcChaveAtc(parsed);
+  var agora = Date.now();
+  mcPodarAtc();
+  if (_mcAtcContado[chave] && (agora - _mcAtcContado[chave]) < MC_ATC_JANELA_MS) return;
+  _mcAtcContado[chave] = agora;
+  mcCancelarPendente(chave);
   trackEvent('AddToCart', {
     variantId: parsed.variantId,
+    name: parsed.name || '',
     content_ids: [String(parsed.productId || parsed.variantId)],
     content_type: 'product',
-    value: 0,
+    // 2026-08-24: era `0` fixo. Toda adicao chegava na Meta valendo zero,
+    // cegando otimizacao por valor. Agora vem da resposta do /cart/add.js.
+    value: parsed.price || 0,
     quantity: parsed.quantity
   });
+}
+
+function mcAgendarAtc(parsed){
+  if (!parsed || !parsed.variantId) return;
+  var chave = mcChaveAtc(parsed);
+  if (_mcAtcPendente[chave]) return;
+  if (_mcAtcContado[chave] && (Date.now() - _mcAtcContado[chave]) < MC_ATC_JANELA_MS) return;
+  // Guarda o dado JUNTO do timer: a descarga do `pagehide` precisa saber o que
+  // contar, e um id de timer sozinho nao diz nada.
+  _mcAtcPendente[chave] = {
+    parsed: parsed,
+    timer: setTimeout(function(){
+      delete _mcAtcPendente[chave];
+      mcContarAtc(parsed);
+    }, MC_ATC_ESPERA_MS)
+  };
+}
+
+/* POST nativo navega antes do timer. Descarrega o que estiver agendado. */
+function mcDescarregarPendentes(){
+  var chaves = Object.keys(_mcAtcPendente);
+  for (var i = 0; i < chaves.length; i++) {
+    var p = _mcAtcPendente[chaves[i]];
+    if (!p) continue;
+    clearTimeout(p.timer);
+    delete _mcAtcPendente[chaves[i]];
+    mcContarAtc(p.parsed);
+  }
+}
+
+function onAtcSuccess(body){
+  mcContarAtc(parseAtcBody(body));
 }
 
 /* ---- Fetch wrap — observe-only, never blocks ---- */
@@ -272,12 +556,30 @@ function setupATCHook(){
       url = typeof input === 'string' ? input : (input && input.url) || '';
     } catch (e) {}
     var isAtc = url.indexOf('/cart/add.js') !== -1 || url.indexOf('/cart/add') !== -1;
+    var parsedAqui = null;
+    if (isAtc) {
+      // O fetch e autoritativo: existindo, ele decide. Cancela o agendamento
+      // que o submit deixou, inclusive quando a resposta for erro — adicao que
+      // falhou nao pode virar AddToCart pela porta dos fundos.
+      try {
+        parsedAqui = parseAtcBody(init && init.body);
+        if (parsedAqui && parsedAqui.variantId) mcCancelarPendente(mcChaveAtc(parsedAqui));
+      } catch (e) {}
+    }
     var promise = _fetch.apply(this, arguments);
     if (isAtc) {
       promise.then(function(res){
-        if (res && res.ok) {
-          try { onAtcSuccess(init && init.body); } catch (e) {}
-        }
+        if (!(res && res.ok)) return;
+        var base;
+        try { base = parsedAqui || parseAtcBody(init && init.body); } catch (e) { return; }
+        var lendo = null;
+        try {
+          if (typeof res.clone === 'function') lendo = res.clone().json();
+        } catch (e) { lendo = null; }
+        if (!lendo || typeof lendo.then !== 'function') { mcContarAtc(base); return; }
+        lendo.then(function(corpo){
+          mcContarAtc(mcEnriquecerComResposta(base, corpo));
+        }).catch(function(){ mcContarAtc(base); });
       }).catch(function(){});
     }
     return promise;
@@ -288,11 +590,15 @@ function setupATCHook(){
     var form = e.target;
     if (form && form.matches && form.matches('form[action*="/cart/add"]')) {
       try {
-        var fd = new FormData(form);
-        onAtcSuccess(fd);
+        mcAgendarAtc(parseAtcBody(new FormData(form)));
       } catch (err) {}
     }
   }, true);
+
+  // POST nativo faz a pagina navegar antes do timer vencer. Sem isto, tema
+  // sem AJAX perderia o AddToCart inteiro.
+  window.addEventListener('pagehide', mcDescarregarPendentes);
+  window.addEventListener('beforeunload', mcDescarregarPendentes);
 }
 
 /* ---- Checkout click hook — observe-only, never preventDefault ---- */
