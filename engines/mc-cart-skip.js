@@ -11,6 +11,9 @@
 
 const C = window.mcCartConfig;
 if (!C || C.cart_mode !== 'skip-checkout') return;
+/* Flags do bloco multi-pixel (ver 'Multi-pixel da Meta' abaixo). skip (legado): aditivo, sem injetar SDK. */
+var MC_META_NOMEAR_DESTINO = false;
+var MC_META_CARREGAR_SDK = false;
 
 const POOL = C.pool || { members: [], assigned: null };
 let assignedMember = null;
@@ -71,9 +74,32 @@ async function ensureMemberAssigned(){
       if (!assignedMember) assignedMember = candidates[candidates.length - 1];
     }
   }
-  if (!assignedMember) throw new Error('no_active_pool_member');
+  if (!assignedMember) {
+    // 2026-08-23: same last-resort as mc-cart-page.js — empty pool must
+    // not hard-fail when the loader already put checkout credentials on C,
+    // but an `allCapped` empty pool is intentional and must be respected.
+    var legacyMaps = C && C.legacyProductMappings;
+    var temMapa = !!legacyMaps && Object.keys(legacyMaps).length > 0;
+    // Sem mapa o member sintetizado nao traduz nada — melhor nao existir.
+    if (!POOL.allCapped && C && C.domain && C.token && temMapa) {
+      assignedMember = {
+        id: 'legacy-config',
+        domain: C.domain,
+        storefrontToken: C.token,
+        productMappings: legacyMaps,
+        is_primary: true,
+        weight: 1,
+        status: 'active',
+      };
+      // Must live in POOL.members — that is the array pickCoherentMember reads.
+      if (!Array.isArray(POOL.members)) POOL.members = [];
+      POOL.members.push(assignedMember);
+    } else {
+      throw new Error('no_active_pool_member');
+    }
+  }
 
-  writeCookie('mc_pool_v1', { v: 1, mId: assignedMember.id, exp: Date.now() + 7*24*3600*1000 });
+  writeCookie('mc_pool_v1', { v: 1, mId: assignedMember.id, pv: POOL.version || null, exp: Date.now() + 7*24*3600*1000 });
   return assignedMember;
 }
 
@@ -131,25 +157,103 @@ async function createLojaBCart(member, lojaBVariantGid, quantity, autoDiscount){
   return data.data.cartCreate.cart;
 }
 
+/* ---- Multi-pixel da Meta (2026-09-09) ----
+   O loader emite `metaPixelIds` (principal primeiro; so ids, nunca token).
+   Cada pixel configurado e inicializado UMA vez. O que acontece depois
+   depende de dois flags definidos no boot de cada engine:
+     MC_META_NOMEAR_DESTINO — true: cada evento sai por `trackSingle` para
+       CADA pixel (page engine, desenho de #461: o evento nomeia o pixel das
+       campanhas). false: `fbq(verbo)` de sempre, que alcanca os pixels
+       inicializados — os configurados E qualquer outro que tema/app tenha
+       inicializado (drawer/native/skip: aditivo, ninguem deixa de receber).
+     MC_META_CARREGAR_SDK — true: injeta fbevents.js quando nao ha fbq
+       (page engine, #462). false: sem fbq na pagina nada e disparado, como
+       sempre foi nesses engines (consentimento fica com o tema/CMP).
+   O mesmo eventID vai a todo pixel — e ele que casa com o CAPI, que o relay
+   abre em leque para os mesmos pixels. Loader antigo em cache (so `pxMeta`)
+   continua valendo: um pixel.
+   Bloco IDENTICO nos 4 engines — ha teste de paridade textual
+   (multi-pixel-nos-engines.test.ts). Edite os quatro juntos. */
+/* MC:META-MULTIPIXEL:INICIO */
+function mcMetaPixelIds(){
+  var ids = [];
+  try {
+    var lista = Array.isArray(C.metaPixelIds) ? C.metaPixelIds : (C.pxMeta ? [C.pxMeta] : []);
+    for (var i = 0; i < lista.length; i++) {
+      var id = String(lista[i] || '').trim();
+      if (id && ids.indexOf(id) === -1) ids.push(id);
+    }
+  } catch (e) {}
+  return ids;
+}
+
+/* O snippet oficial da Meta se auto-protege (`if(f.fbq)return;`): inerte
+   enquanto outro app/tema carregou o SDK, assume quando ele sair. */
+function mcGarantirSdkMeta(w){
+  try {
+    if (!MC_META_CARREGAR_SDK) return;
+    if (w.fbq) return;                    // app/tema/GTM ja carregou; nao substituir
+    if (!mcMetaPixelIds().length) return; // sem pixel configurado nao ha o que carregar
+    /* eslint-disable */
+    (function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+    n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;
+    n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
+    t.src=v;s=b.getElementsByTagName(e)[0];
+    if(s&&s.parentNode){s.parentNode.insertBefore(t,s);}else{(b.head||b.documentElement).appendChild(t);}
+    })(w,document,'script','https://connect.facebook.net/en_US/fbevents.js');
+    /* eslint-enable */
+  } catch (e) {}
+}
+
+var _mcPixelsInicializados = {};
+
+function mcEnviarFbq(w, verbo, evento, dados, opts){
+  mcGarantirSdkMeta(w);
+  if (!w.fbq) return;
+  var ids = mcMetaPixelIds();
+  for (var i = 0; i < ids.length; i++) {
+    if (!_mcPixelsInicializados[ids[i]]) {
+      /* Marca SO se o init nao lancou; senao tenta de novo no proximo evento. */
+      try { w.fbq('init', ids[i]); _mcPixelsInicializados[ids[i]] = true; } catch (e) {}
+    }
+  }
+  /* Cada chamada protegida: um pixel que lance nao pode derrubar os demais
+     nem o GA4/TikTok/CAPI do mesmo evento (o trackEvent tem um try so). */
+  if (ids.length && MC_META_NOMEAR_DESTINO) {
+    /* trackSingle nomeia o destino; exige o init acima (sem ele o evento some). */
+    var verboUnico = verbo === 'trackCustom' ? 'trackSingleCustom' : 'trackSingle';
+    for (var j = 0; j < ids.length; j++) {
+      try { w.fbq(verboUnico, ids[j], evento, dados, opts); } catch (e) {}
+    }
+    return;
+  }
+  try { w.fbq(verbo, evento, dados, opts); } catch (e) {}
+}
+/* MC:META-MULTIPIXEL:FIM */
+
 /* ---- Pixel firing (Meta, GA4, TikTok, dataLayer) ---- */
 function trackEvent(eventName, payload){
   try {
     const cur = C.currencyCode || 'USD';
+    // eventID por evento (2026-09-09): mesmo id em todo pixel — e a chave da
+    // dedup se este engine um dia passar a chamar o relay CAPI.
+    const eventId = Date.now().toString(36) + '.' + Math.random().toString(36).slice(2, 10);
+    mcGarantirSdkMeta(window);
     if (window.fbq) {
       if (eventName === 'AddToCart') {
-        window.fbq('track', 'AddToCart', {
+        mcEnviarFbq(window, 'track', 'AddToCart', {
           content_ids: [payload.variantId],
           content_type: 'product',
           value: parseFloat(payload.value || 0),
           currency: cur,
           num_items: payload.quantity,
-        });
+        }, { eventID: eventId });
       } else if (eventName === 'InitiateCheckout') {
-        window.fbq('track', 'InitiateCheckout', {
+        mcEnviarFbq(window, 'track', 'InitiateCheckout', {
           value: parseFloat(payload.total || 0),
           currency: cur,
           num_items: payload.quantity,
-        });
+        }, { eventID: eventId });
       }
     }
     if (window.gtag) {
